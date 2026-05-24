@@ -5109,11 +5109,7 @@ fn attach_call_missing_gate_vector_returns_error() {
     let path = dir.join("call_no_gate.json");
     std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
-    let stmt = parser::parse(&format!(
-        r#"ATTACH CALL FROM FILE "{}";"#,
-        lql_path(&path)
-    ))
-    .unwrap();
+    let stmt = parser::parse(&format!(r#"ATTACH CALL FROM FILE "{}";"#, lql_path(&path))).unwrap();
     let err = session.execute(&stmt).unwrap_err();
     assert!(
         matches!(err, LqlError::Execution(_)),
@@ -5123,13 +5119,47 @@ fn attach_call_missing_gate_vector_returns_error() {
 }
 
 #[test]
+fn attach_call_invalid_monty_code_returns_error() {
+    let (mut session, dir) = vindex_session("attach_call_bad_code");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+    let gate_b64 = larql_vindex::patch::core::encode_gate_vector(&gate);
+    let json = serde_json::json!({
+        "op": "call",
+        "layer": 0,
+        "feature": 1,
+        "gate_vector_b64": gate_b64,
+        "monty_code": "return {'residual_delta': []}",
+    });
+    let path = dir.join("call_bad_code.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+    let stmt = parser::parse(&format!(r#"ATTACH CALL FROM FILE "{}";"#, lql_path(&path))).unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("def main"),
+        "invalid code should mention missing main entrypoint: {err:?}"
+    );
+
+    let overlay = session.patched_overlay_mut().expect("vindex backend");
+    assert!(
+        overlay.call_patch(0, 1).is_none(),
+        "invalid call patch should not be registered"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn attach_call_save_patch_writes_call_op() {
     let (mut session, dir) = vindex_session("attach_call_save");
     let gate = vec![1.0f32, 0.0, 0.0, 0.0];
     let patch_path = write_call_patch_json(&dir, &gate);
 
-    let begin = parser::parse(&format!(r#"BEGIN PATCH "{}";"#, lql_path(&dir.join("out.vlp"))))
-        .unwrap();
+    let begin = parser::parse(&format!(
+        r#"BEGIN PATCH "{}";"#,
+        lql_path(&dir.join("out.vlp"))
+    ))
+    .unwrap();
     session.execute(&begin).expect("BEGIN PATCH");
 
     let attach = parser::parse(&format!(
@@ -5184,11 +5214,7 @@ fn attach_call_apply_patch_rehydrates_call() {
     let vlp_path = dir.join("call.vlp");
     vlp.save(&vlp_path).expect("save vlp");
 
-    let apply = parser::parse(&format!(
-        r#"APPLY PATCH "{}";"#,
-        lql_path(&vlp_path)
-    ))
-    .unwrap();
+    let apply = parser::parse(&format!(r#"APPLY PATCH "{}";"#, lql_path(&vlp_path))).unwrap();
     session.execute(&apply).expect("APPLY PATCH");
 
     let overlay = session.patched_overlay_mut().expect("vindex backend");
@@ -5206,8 +5232,11 @@ fn compile_into_model_with_call_patch_returns_error() {
     let gate = vec![1.0f32, 0.0, 0.0, 0.0];
     let patch_path = write_call_patch_json(&dir, &gate);
 
-    let begin = parser::parse(&format!(r#"BEGIN PATCH "{}";"#, lql_path(&dir.join("x.vlp"))))
-        .unwrap();
+    let begin = parser::parse(&format!(
+        r#"BEGIN PATCH "{}";"#,
+        lql_path(&dir.join("x.vlp"))
+    ))
+    .unwrap();
     session.execute(&begin).expect("BEGIN PATCH");
 
     let attach = parser::parse(&format!(

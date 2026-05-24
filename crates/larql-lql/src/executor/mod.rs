@@ -522,6 +522,7 @@ impl Session {
         let mut op = parse_call_patch_op(&text)?;
         let call = match &mut op {
             larql_vindex::PatchOp::Call(call) => {
+                validate_call_patch_code(call)?;
                 call.ensure_code_hash();
                 call.clone()
             }
@@ -598,4 +599,28 @@ fn parse_call_patch_op(text: &str) -> Result<larql_vindex::PatchOp, LqlError> {
         ));
     }
     Ok(op)
+}
+
+fn validate_call_patch_code(call: &larql_vindex::CallPatchOp) -> Result<(), LqlError> {
+    let code = call.monty_code.trim();
+    if code.is_empty() {
+        return Err(LqlError::Execution(
+            "call patch monty_code must not be empty".into(),
+        ));
+    }
+
+    // This is intentionally a source-level guard until the Monty VM crate is
+    // wired into the workspace. It catches the common bad-patch cases at
+    // attach time without pretending to be a full parser.
+    let has_main_entrypoint = code
+        .lines()
+        .map(str::trim_start)
+        .any(|line| line.starts_with("def main("));
+    if !has_main_entrypoint {
+        return Err(LqlError::Execution(
+            "call patch monty_code must define `def main(...)`".into(),
+        ));
+    }
+
+    Ok(())
 }
