@@ -1,5 +1,92 @@
 Plan: Monty-call patches for LARQL
 
+Current status snapshot
+
+This document is now split into two readings:
+
+* **Already done**: the repository has the schema, patch overlay, docs, LQL
+  file-backed attach flow, and an opt-in inference-side execution seam for
+  call patches.
+* **Remaining**: the actual Monty VM runner, broader inference-path coverage,
+  production safety hardening, public metrics/trace surfacing, benchmarks, and
+  the training pipeline.
+
+Already implemented in-tree
+
+* Documentation:
+    * [docs/monty-call-patches.md](docs/monty-call-patches.md) exists and
+      states the runtime contract, patch JSON shape, LQL surface, compile
+      behavior, and current implementation status.
+    * [docs/specs.md](docs/specs.md), [docs/inference-engine.md](docs/inference-engine.md),
+      [docs/lql-guide.md](docs/lql-guide.md), and
+      [crates/larql-vindex/docs/operations-spec.md](crates/larql-vindex/docs/operations-spec.md)
+      reference call patches.
+* `larql-vindex`:
+    * `PatchOp::Call(CallPatchOp)` is implemented in
+      [crates/larql-vindex/src/patch/format.rs](crates/larql-vindex/src/patch/format.rs).
+    * `CallPatchOp`, `CallTrigger`, `CallResourceLimits`, `CallSafetyPolicy`,
+      and `PatchCounts.calls` are implemented with serde support.
+    * `PatchedVindex` stores call metadata, inserts call gate vectors into the
+      overlay, exposes `call_patch(layer, feature)` / `call_patches_for_layer`,
+      and applies call ops through the patch overlay.
+    * `crates/larql-vindex/examples/call_patch_roundtrip.rs` demonstrates
+      call patch save/load and overlay lookup.
+* `larql-lql`:
+    * `ATTACH CALL FROM FILE "..."` is implemented and tested.
+    * Inline `ATTACH CALL ... GATE VECTOR FROM FILE ... MONTY CODE FROM FILE ...`
+      is implemented and tested for the current vertical slice.
+    * File-backed attach auto-starts a patch session, validates the gate vector
+      against hidden size, fills `code_hash` when absent, and persists the call
+      op in `.vlp`.
+    * `COMPILE INTO MODEL` rejects runtime call patches.
+    * `COMPILE INTO VINDEX` writes call patches to `runtime_patches.vlp` by
+      default, and `COMPILE INTO VINDEX STATIC_ONLY` rejects them.
+* `larql-inference`:
+    * [crates/larql-inference/src/monty_call/mod.rs](crates/larql-inference/src/monty_call/mod.rs)
+      implements trigger checks, JSON input encoding, output decoding, residual
+      clamping, sparse logit-bias decoding, metrics, and
+      `MontyCallRuntime<R: CallProgramRunner>`.
+    * `WalkFfn` has opt-in `with_call_patches(...)` and
+      `with_call_runtime(...)` hooks. Selected call features are looked up
+      after gate selection, executed through the installed runtime, and skipped
+      as static FFN rows.
+
+Still remaining
+
+* Wire a concrete Monty VM-backed `CallProgramRunner` into
+  `larql-inference`. The current runtime is injectable/testable, but stops at
+  the deterministic boundary around the call.
+* Extend execution beyond the sparse CPU `WalkFfn` path:
+    * dense/static FFN paths
+    * Metal/GPU paths
+    * full mmap/kquant paths where applicable
+    * batched prefill and generation loop integration
+* Expand inline LQL beyond the current file-backed/gate-code vertical slice if
+  richer `INPUT (...)`, `OUTPUT (...)`, and policy grammar proves necessary.
+* Harden runtime policy:
+    * cooldowns and per-sequence budgets
+    * end-to-end timeout/memory limits using Monty resource tracking
+    * trace/metrics surfacing through public inference APIs
+    * false-fire and residual-explosion tests
+* Benchmark the no-call, loaded-but-not-fired, and fired-call paths.
+* Build the codec roadmap beyond the current raw residual / top-k basis /
+  sparse basis delta / sparse logit-bias support.
+* Implement the training prototype and later research-grade training loop.
+
+Recommended next milestone
+
+The next highest-leverage step is a concrete Monty VM runner behind
+`CallProgramRunner`, then one end-to-end synthetic test where a file-backed
+call patch fires inside sparse CPU `WalkFfn`, returns a bounded residual delta,
+and changes the expected next-token logits while the no-call and non-fired
+paths remain unchanged.
+
+Reading note
+
+The detailed phase plan below is preserved as the original implementation map.
+Where it says "proposed" for items now listed above as implemented, treat the
+status snapshot as authoritative.
+
 Source verification status
 
 Confirmed from current public repo/docs:
@@ -33,12 +120,31 @@ Confirmed Monty symbols / paths:
 * MontyObject includes Dict(DictPairs), List, Tuple, Int, Float, String, Bytes, etc.; JSON-facing wrappers exist in object_json.  ￼
 * Monty supports deterministic sandboxing/resource limits, no host FS/network/env except controlled external calls, snapshot/resume, and microsecond startup claims in README.  ￼
 
-Could not confirm from raw LARQL source in this environment:
+Locally confirmed in this repository since the original plan was written:
 
-* Exact Rust definition location of PatchOp, VindexPatch, PatchedVindex, GateIndex, WalkFfn, FfnBackend, and LayerHook; docs confirm names/semantics, but exact file and signature must be verified locally before implementation.
-* Exact parser AST enum names under larql-lql/src/ast.rs and exact executor dispatch function names.
-* Exact FFN call signature where WalkFfn mutates residuals.
-* Exact compile module file names beyond docs mentioning executor/lifecycle/compile/mod.rs and into_model.rs.  ￼
+* `PatchOp`, `VindexPatch`, `CallPatchOp`, `CallTrigger`, `CallResourceLimits`,
+  and `CallSafetyPolicy` live in
+  [crates/larql-vindex/src/patch/format.rs](crates/larql-vindex/src/patch/format.rs).
+* `PatchedVindex` and call-patch overlay storage live in
+  [crates/larql-vindex/src/patch/overlay.rs](crates/larql-vindex/src/patch/overlay.rs),
+  with apply behavior in
+  [crates/larql-vindex/src/patch/overlay_apply.rs](crates/larql-vindex/src/patch/overlay_apply.rs).
+* `GateIndex` is defined in
+  [crates/larql-vindex/src/index/types/ffn_row/mod.rs](crates/larql-vindex/src/index/types/ffn_row/mod.rs).
+* `WalkFfn` is defined in
+  [crates/larql-inference/src/vindex/walk_ffn/mod.rs](crates/larql-inference/src/vindex/walk_ffn/mod.rs)
+  and now carries optional call-patch lookup/runtime hooks.
+* The inference call runtime seam lives in
+  [crates/larql-inference/src/monty_call/mod.rs](crates/larql-inference/src/monty_call/mod.rs).
+* `LayerHook` is defined under `larql-inference/src/forward/hooks`.
+* `ATTACH CALL` executor tests live in
+  [crates/larql-lql/src/executor/tests.rs](crates/larql-lql/src/executor/tests.rs).
+
+Still incomplete:
+
+* Concrete Monty VM execution from `larql-inference`; only the runner trait and
+  deterministic runtime boundary are implemented.
+* Production API surface for exposing call metrics/traces to callers.
 
 ⸻
 
