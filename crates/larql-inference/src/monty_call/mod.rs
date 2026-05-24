@@ -31,6 +31,13 @@ pub enum CallError {
     InvalidLogitBias(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallFailurePolicy {
+    IgnoreAndContinue,
+    ZeroOutputAndLog,
+    AbortForward,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CallCandidate {
     pub rank: usize,
@@ -143,7 +150,7 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
             Ok(raw) => raw,
             Err(err) => {
                 self.metrics.failed += 1;
-                return Err(err);
+                return handle_failure(call, hidden_size, err);
             }
         };
         let elapsed_us = t0.elapsed().as_micros() as u64;
@@ -157,12 +164,35 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
             Ok(output) => output,
             Err(err) => {
                 self.metrics.failed += 1;
-                return Err(err);
+                return handle_failure(call, hidden_size, err);
             }
         };
         apply_safety(&mut output, &call.safety);
         self.metrics.fired += 1;
         Ok(Some(output))
+    }
+}
+
+fn handle_failure(
+    call: &CallPatchOp,
+    hidden_size: usize,
+    err: CallError,
+) -> Result<Option<CallOutput>, CallError> {
+    match failure_policy(&call.safety) {
+        CallFailurePolicy::IgnoreAndContinue => Ok(None),
+        CallFailurePolicy::ZeroOutputAndLog => Ok(Some(CallOutput {
+            residual_delta: Some(vec![0.0; hidden_size]),
+            logit_bias: None,
+        })),
+        CallFailurePolicy::AbortForward => Err(err),
+    }
+}
+
+fn failure_policy(safety: &CallSafetyPolicy) -> CallFailurePolicy {
+    match safety.failure_policy.as_str() {
+        "abort" | "abort_forward" | "error" => CallFailurePolicy::AbortForward,
+        "zero" | "zero_output" | "zero_output_and_log" => CallFailurePolicy::ZeroOutputAndLog,
+        _ => CallFailurePolicy::IgnoreAndContinue,
     }
 }
 
@@ -242,11 +272,17 @@ fn encode_residual_source(call: &CallPatchOp, residual: &[f32]) -> Vec<(String, 
     if let Some(sources) = call.input_schema.get("sources").and_then(|s| s.as_array()) {
         let mut out = Vec::new();
         for src in sources {
-            let kind = src.get("kind").and_then(|k| k.as_str()).unwrap_or("current_residual");
+            let kind = src
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("current_residual");
             if kind != "current_residual" {
                 continue;
             }
-            let key = src.get("key").and_then(|k| k.as_str()).unwrap_or("residual");
+            let key = src
+                .get("key")
+                .and_then(|k| k.as_str())
+                .unwrap_or("residual");
             let codec_kind = src
                 .get("codec")
                 .and_then(|c| c.get("kind"))
@@ -259,7 +295,9 @@ fn encode_residual_source(call: &CallPatchOp, residual: &[f32]) -> Vec<(String, 
                         .and_then(|c| c.get("k"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(8) as usize;
-                    if let Some(basis) = extract_basis_from_schema(src.get("codec").unwrap_or(&Value::Null)) {
+                    if let Some(basis) =
+                        extract_basis_from_schema(src.get("codec").unwrap_or(&Value::Null))
+                    {
                         encode_topk_basis(residual, &basis, k)
                     } else {
                         json!(residual) // fallback to raw if basis missing
@@ -305,11 +343,17 @@ fn decode_residual_delta_sink(
 ) -> Result<Option<Vec<f32>>, CallError> {
     if let Some(sinks) = call.output_schema.get("sinks").and_then(|s| s.as_array()) {
         for sink in sinks {
-            let kind = sink.get("kind").and_then(|k| k.as_str()).unwrap_or("residual_delta");
+            let kind = sink
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("residual_delta");
             if kind != "residual_delta" {
                 continue;
             }
-            let key = sink.get("key").and_then(|k| k.as_str()).unwrap_or("residual_delta");
+            let key = sink
+                .get("key")
+                .and_then(|k| k.as_str())
+                .unwrap_or("residual_delta");
             let codec_kind = sink
                 .get("codec")
                 .and_then(|c| c.get("kind"))
@@ -320,7 +364,9 @@ fn decode_residual_delta_sink(
                 None => Ok(None),
                 Some(value) => match codec_kind {
                     "sparse_basis_delta" => {
-                        if let Some(basis) = extract_basis_from_schema(sink.get("codec").unwrap_or(&Value::Null)) {
+                        if let Some(basis) =
+                            extract_basis_from_schema(sink.get("codec").unwrap_or(&Value::Null))
+                        {
                             decode_sparse_basis_delta(key, value, &basis, hidden_size).map(Some)
                         } else {
                             decode_f32_array(key, value, Some(hidden_size)).map(Some)
@@ -414,7 +460,11 @@ pub fn encode_topk_basis(residual: &[f32], basis: &[Vec<f32>], k: usize) -> Valu
             (i, dot)
         })
         .collect();
-    scores.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    scores.sort_by(|a, b| {
+        b.1.abs()
+            .partial_cmp(&a.1.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scores.truncate(k);
     scores.sort_by_key(|(i, _)| *i); // stable order for determinism
 
@@ -549,6 +599,14 @@ mod tests {
         fn run(&mut self, _call: &CallPatchOp, _input: Value) -> Result<Value, CallError> {
             std::thread::sleep(std::time::Duration::from_micros(self.sleep_us));
             Ok(self.output.clone())
+        }
+    }
+
+    struct FailingRunner;
+
+    impl CallProgramRunner for FailingRunner {
+        fn run(&mut self, _call: &CallPatchOp, _input: Value) -> Result<Value, CallError> {
+            Err(CallError::MissingKey("boom".into()))
         }
     }
 
@@ -880,6 +938,110 @@ mod tests {
         assert_eq!(runtime.metrics().timed_out, 0);
     }
 
+    #[test]
+    fn runtime_failure_policy_ignores_runner_error_by_default() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(FailingRunner);
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        assert!(output.is_none());
+        assert_eq!(runtime.metrics().failed, 1);
+        assert_eq!(runtime.metrics().fired, 0);
+    }
+
+    #[test]
+    fn runtime_failure_policy_zeroes_decode_error() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.safety.failure_policy = "zero_output_and_log".into();
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [1.0, 2.0]}),
+        });
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap()
+            .expect("zero policy should return a zero output");
+
+        assert_eq!(output.residual_delta.unwrap(), vec![0.0, 0.0, 0.0]);
+        assert_eq!(runtime.metrics().failed, 1);
+        assert_eq!(runtime.metrics().fired, 0);
+    }
+
+    #[test]
+    fn runtime_failure_policy_abort_returns_error() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.safety.failure_policy = "abort_forward".into();
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(FailingRunner);
+
+        let err = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, CallError::MissingKey(_)));
+        assert_eq!(runtime.metrics().failed, 1);
+        assert_eq!(runtime.metrics().fired, 0);
+    }
+
     // ── TopK basis codec tests ────────────────────────────────────────────────
 
     fn identity_basis(n: usize) -> Vec<Vec<f32>> {
@@ -940,7 +1102,10 @@ mod tests {
         });
         let decoded = decode_sparse_basis_delta("test", &as_sparse, &basis, 4).unwrap();
         // Should recover the dominant component
-        assert!((decoded[0] - 10.0).abs() < 1e-5, "dominant component preserved");
+        assert!(
+            (decoded[0] - 10.0).abs() < 1e-5,
+            "dominant component preserved"
+        );
     }
 
     #[test]
@@ -1009,6 +1174,9 @@ mod tests {
             .collect();
         assert!(indices.contains(&0), "idx 0 (score 5) should be in top-2");
         assert!(indices.contains(&1), "idx 1 (score -3) should be in top-2");
-        assert!(!indices.contains(&2), "idx 2 (score 1) should not be in top-2");
+        assert!(
+            !indices.contains(&2),
+            "idx 2 (score 1) should not be in top-2"
+        );
     }
 }
