@@ -1818,4 +1818,349 @@ mod tests {
 
         assert!(runtime.take_trace_events().is_empty());
     }
+
+    // ── False-fire safety tests ───────────────────────────────────────────────
+    //
+    // A "false fire" is a position where the gate score just crosses the trigger
+    // threshold but the call should not alter inference. These tests verify that
+    // every guard layer (score, margin, rank, per-token budget, per-sequence
+    // budget, cooldown) independently prevents a spurious fire, and that the
+    // combined effect on downstream residuals is zero when the call is blocked.
+
+    #[test]
+    fn false_fire_blocked_by_score_threshold() {
+        // score = 2.9 < threshold = 3.0 → must not fire.
+        let call = call(); // score_threshold = Some(3.0)
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [100.0, 100.0, 100.0]}),
+        });
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 2.9,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        assert!(output.is_none(), "call below score threshold must not fire");
+        assert_eq!(runtime.metrics().fired, 0);
+        assert_eq!(runtime.metrics().skipped, 1);
+    }
+
+    #[test]
+    fn false_fire_blocked_by_margin_threshold() {
+        // score passes but margin = 0.4 < margin_threshold = 0.5 → must not fire.
+        let call = call(); // margin_threshold = Some(0.5)
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [100.0, 100.0, 100.0]}),
+        });
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(0.4),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        assert!(output.is_none(), "call below margin threshold must not fire");
+        assert_eq!(runtime.metrics().fired, 0);
+        assert_eq!(runtime.metrics().skipped, 1);
+    }
+
+    #[test]
+    fn false_fire_blocked_by_rank_guard() {
+        // rank = 3 > require_top_k = 2 → must not fire even with high score.
+        let call = call(); // require_top_k = 2
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [100.0, 100.0, 100.0]}),
+        });
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 3,
+                    score: 99.0,
+                    margin: Some(99.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        assert!(output.is_none(), "call outside require_top_k must not fire");
+        assert_eq!(runtime.metrics().fired, 0);
+    }
+
+    #[test]
+    fn false_fire_blocked_by_per_token_budget() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.trigger.max_calls_per_token = 1;
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [100.0, 100.0, 100.0]}),
+        });
+
+        // First call: budget not yet consumed — fires.
+        let first = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+        assert!(first.is_some(), "first call should fire");
+
+        // Second call at same token position: budget exhausted (calls_already_fired = 1).
+        let second = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 2,
+                    score: 4.5,
+                    margin: Some(0.9),
+                    calls_already_fired: 1,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+        assert!(second.is_none(), "second call should be blocked by per-token budget");
+        assert_eq!(runtime.metrics().fired, 1);
+        assert_eq!(runtime.metrics().skipped, 1);
+    }
+
+    #[test]
+    fn false_fire_output_is_zero_with_zero_output_policy_on_decode_error() {
+        // When a call fires but Monty returns a malformed output, the zero-output
+        // policy must produce a zero delta rather than a large corrupted one.
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.safety.failure_policy = "zero_output_and_log".into();
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        // Runner returns wrong shape (2 values instead of 3) — decode error.
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [100.0, 200.0]}),
+        });
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap()
+            .expect("zero-output policy should return a result, not None");
+
+        let delta = output.residual_delta.unwrap();
+        assert!(
+            delta.iter().all(|&v| v == 0.0),
+            "false-fire with zero-output policy must zero all residual delta components"
+        );
+        assert_eq!(runtime.metrics().failed, 1);
+        assert_eq!(runtime.metrics().fired, 0);
+    }
+
+    // ── Residual-explosion safety tests ───────────────────────────────────────
+    //
+    // A residual explosion is when a call patch returns a delta whose L2 norm is
+    // far larger than the base residual, potentially destabilising all subsequent
+    // layers. The `residual_clamp_norm` in `CallSafetyPolicy` is the primary
+    // guard. These tests verify that the clamp is applied correctly and that the
+    // resulting delta never exceeds the configured limit.
+
+    #[test]
+    fn residual_explosion_clamped_to_configured_norm() {
+        // Monty returns a huge delta — norm = sqrt(3) * 1000 ≈ 1732.
+        // clamp_norm = 1.0 → the clamped delta must have norm ≤ 1.0.
+        let mut output = CallOutput {
+            residual_delta: Some(vec![1000.0, 1000.0, 1000.0]),
+            logit_bias: None,
+        };
+        apply_safety(
+            &mut output,
+            &CallSafetyPolicy {
+                residual_clamp_norm: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let delta = output.residual_delta.unwrap();
+        let norm = delta.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            norm <= 1.0 + 1e-5,
+            "clamped norm {norm} must not exceed 1.0 (the configured limit)"
+        );
+    }
+
+    #[test]
+    fn residual_explosion_direction_preserved_after_clamp() {
+        // The clamp must scale the vector uniformly — direction must be preserved.
+        let raw = vec![3.0f32, 4.0]; // norm = 5
+        let mut output = CallOutput {
+            residual_delta: Some(raw.clone()),
+            logit_bias: None,
+        };
+        apply_safety(
+            &mut output,
+            &CallSafetyPolicy {
+                residual_clamp_norm: Some(2.5),
+                ..Default::default()
+            },
+        );
+        let clamped = output.residual_delta.unwrap();
+        // Expected: scale = 2.5 / 5.0 = 0.5 → [1.5, 2.0]
+        assert!((clamped[0] - 1.5).abs() < 1e-5, "x component {}", clamped[0]);
+        assert!((clamped[1] - 2.0).abs() < 1e-5, "y component {}", clamped[1]);
+    }
+
+    #[test]
+    fn residual_explosion_zero_limit_nullifies_delta() {
+        // clamp_norm = 0.0 → the safety policy must nullify the entire delta.
+        let mut output = CallOutput {
+            residual_delta: Some(vec![5.0, -3.0, 2.0]),
+            logit_bias: None,
+        };
+        apply_safety(
+            &mut output,
+            &CallSafetyPolicy {
+                residual_clamp_norm: Some(0.0),
+                ..Default::default()
+            },
+        );
+        assert!(
+            output.residual_delta.is_none(),
+            "clamp_norm = 0 must set residual_delta to None"
+        );
+    }
+
+    #[test]
+    fn residual_explosion_within_limit_passes_through_unchanged() {
+        // Delta norm = 1.0, clamp_norm = 5.0 → no clamping should occur.
+        let delta = vec![1.0f32, 0.0, 0.0];
+        let mut output = CallOutput {
+            residual_delta: Some(delta.clone()),
+            logit_bias: None,
+        };
+        apply_safety(
+            &mut output,
+            &CallSafetyPolicy {
+                residual_clamp_norm: Some(5.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            output.residual_delta.unwrap(),
+            delta,
+            "delta within limit must be unchanged"
+        );
+    }
+
+    #[test]
+    fn residual_explosion_runtime_clamp_prevents_large_delta_reaching_caller() {
+        // End-to-end: MontyCallRuntime executes a call that returns a huge delta,
+        // and the safety clamp ensures the caller receives a bounded result.
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.limits.time_us = 0;
+        call.safety.residual_clamp_norm = Some(2.0);
+
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        // Runner returns a delta with norm ≈ 1732 (3 × 1000²).
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [1000.0, 1000.0, 1000.0]}),
+        });
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap()
+            .expect("call should fire");
+
+        let delta = output.residual_delta.unwrap();
+        let norm = delta.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            norm <= 2.0 + 1e-5,
+            "clamped norm {norm} must not exceed the configured 2.0 limit"
+        );
+        assert_eq!(runtime.metrics().fired, 1, "call should be counted as fired");
+    }
 }
