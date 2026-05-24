@@ -141,6 +141,7 @@ pub enum Keyword {
     Converged,
     Compact,
     Status,
+    StaticOnly,
 }
 
 impl Keyword {
@@ -256,6 +257,7 @@ impl Keyword {
             Self::Converged => "converged",
             Self::Compact => "compact",
             Self::Status => "status",
+            Self::StaticOnly => "static_only",
         }
     }
 
@@ -368,6 +370,7 @@ impl Keyword {
             "CONVERGED" => Some(Self::Converged),
             "COMPACT" => Some(Self::Compact),
             "STATUS" => Some(Self::Status),
+            "STATIC_ONLY" => Some(Self::StaticOnly),
             _ => None,
         }
     }

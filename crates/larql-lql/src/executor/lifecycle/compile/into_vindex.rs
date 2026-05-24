@@ -20,7 +20,7 @@ use super::atomic::run_atomic_compile;
 use super::bake::{
     apply_memit_deltas_to_down_weights, patch_down_weights, patch_gate_vectors, patch_up_weights,
 };
-use super::{collect_memit_facts_with_recording, reject_runtime_call_patches};
+use super::collect_memit_facts_with_recording;
 
 /// Walk the ordered patch history and return the (layer, feature) slots
 /// touched by more than one patch, along with the write count. Used by
@@ -52,6 +52,7 @@ impl Session {
         source_path: &std::path::Path,
         output: &str,
         on_conflict: CompileConflict,
+        static_only: bool,
     ) -> Result<Vec<String>, LqlError> {
         // Snapshot the source path before we hand control to the atomic
         // wrapper so the inner closure can re-borrow `self` without aliasing.
@@ -63,7 +64,7 @@ impl Session {
         };
 
         run_atomic_compile(&final_dir, &source_path_owned, |output_dir| {
-            self.bake_compile_into_vindex(output_dir, on_conflict)
+            self.bake_compile_into_vindex(output_dir, on_conflict, static_only)
         })
     }
 
@@ -71,6 +72,7 @@ impl Session {
         &mut self,
         output_dir: &std::path::Path,
         on_conflict: CompileConflict,
+        static_only: bool,
     ) -> Result<Vec<String>, LqlError> {
         // Load the current vindex with patches applied
         let (path, config, patched) = self.require_vindex()?;
@@ -129,7 +131,60 @@ impl Session {
             .as_ref()
             .map(|r| r.operations.clone())
             .unwrap_or_default();
-        reject_runtime_call_patches(patched, &recording_ops, "VINDEX")?;
+
+        // ── Call-patch sidecar / static-only handling ──
+        //
+        // Call patches cannot be baked into static weights. The default
+        // behavior is to extract them into a sidecar `runtime_patches.vlp`
+        // in the output directory so a runtime loader can pick them up.
+        // STATIC_ONLY rejects instead of writing the sidecar.
+        let call_ops: Vec<larql_vindex::CallPatchOp> = patched
+            .patches
+            .iter()
+            .flat_map(|p| p.operations.iter())
+            .chain(recording_ops.iter())
+            .filter_map(|op| {
+                if let larql_vindex::PatchOp::Call(c) = op {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut call_sidecar_warning: Option<String> = None;
+        if !call_ops.is_empty() {
+            if static_only {
+                return Err(LqlError::Execution(
+                    "COMPILE INTO VINDEX STATIC_ONLY: call patches are not allowed in static mode"
+                        .into(),
+                ));
+            }
+            // Write sidecar runtime_patches.vlp.
+            let sidecar_path = output_dir.join("runtime_patches.vlp");
+            let sidecar = larql_vindex::VindexPatch {
+                version: 1,
+                base_model: String::new(),
+                base_checksum: None,
+                created_at: "compiled".into(),
+                description: Some("runtime call patches extracted from COMPILE INTO VINDEX".into()),
+                author: None,
+                tags: vec!["runtime".into(), "call".into()],
+                operations: call_ops
+                    .into_iter()
+                    .map(larql_vindex::PatchOp::Call)
+                    .collect(),
+            };
+            let call_count = sidecar.operations.len();
+            sidecar
+                .save(&sidecar_path)
+                .map_err(|e| LqlError::exec("write runtime_patches.vlp sidecar", e))?;
+            call_sidecar_warning = Some(format!(
+                "Warning: {call_count} call patch(es) cannot be baked into static weights — written to {}",
+                sidecar_path.display()
+            ));
+        }
+
         let collected = collect_memit_facts_with_recording(patched, path, &recording_ops)?;
         let memit_facts = collected.facts;
         let memit_warnings = collected.warnings;
@@ -392,6 +447,9 @@ impl Session {
         ));
         out.push(format!("Features: {}", dm_count));
         out.extend(memit_warnings);
+        if let Some(w) = call_sidecar_warning {
+            out.push(w);
+        }
         if !collisions.is_empty() {
             let strategy = match on_conflict {
                 CompileConflict::LastWins => "LAST_WINS",

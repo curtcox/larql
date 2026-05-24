@@ -1782,6 +1782,42 @@ fn parse_compile_into_model_explicit() {
     }
 }
 
+#[test]
+fn parse_compile_into_vindex_static_only() {
+    let stmt = parse(r#"COMPILE CURRENT INTO VINDEX "out.vindex" STATIC_ONLY;"#).unwrap();
+    match stmt {
+        Statement::Compile { target, static_only, on_conflict, .. } => {
+            assert_eq!(target, CompileTarget::Vindex);
+            assert!(static_only, "STATIC_ONLY flag should be true");
+            assert_eq!(on_conflict, None);
+        }
+        _ => panic!("expected Compile"),
+    }
+}
+
+#[test]
+fn parse_compile_into_vindex_static_only_with_on_conflict() {
+    let stmt =
+        parse(r#"COMPILE CURRENT INTO VINDEX "out.vindex" ON CONFLICT LAST_WINS STATIC_ONLY;"#)
+            .unwrap();
+    match stmt {
+        Statement::Compile { static_only, on_conflict, .. } => {
+            assert!(static_only);
+            assert_eq!(on_conflict, Some(CompileConflict::LastWins));
+        }
+        _ => panic!("expected Compile"),
+    }
+}
+
+#[test]
+fn parse_compile_into_model_static_only_errors() {
+    let result = parse(r#"COMPILE CURRENT INTO MODEL "out/" STATIC_ONLY;"#);
+    assert!(
+        result.is_err(),
+        "STATIC_ONLY must reject COMPILE INTO MODEL"
+    );
+}
+
 // ══════════════════════════════════════════════════════════════
 // TRACE STATEMENTS
 // ══════════════════════════════════════════════════════════════

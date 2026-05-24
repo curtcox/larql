@@ -196,7 +196,8 @@ impl Session {
                 format,
                 target,
                 on_conflict,
-            } => self.exec_compile(vindex, output, *format, *target, *on_conflict),
+                static_only,
+            } => self.exec_compile(vindex, output, *format, *target, *on_conflict, *static_only),
             Statement::Diff {
                 a,
                 b,

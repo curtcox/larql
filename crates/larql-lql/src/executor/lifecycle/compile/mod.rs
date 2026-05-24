@@ -20,6 +20,7 @@ impl Session {
         _format: Option<OutputFormat>,
         target: CompileTarget,
         on_conflict: Option<CompileConflict>,
+        static_only: bool,
     ) -> Result<Vec<String>, LqlError> {
         match vindex {
             VindexRef::Current => {
@@ -32,6 +33,7 @@ impl Session {
                         &vindex_path,
                         output,
                         on_conflict.unwrap_or(CompileConflict::LastWins),
+                        static_only,
                     ),
                     CompileTarget::Model => self.exec_compile_into_model(&vindex_path, output),
                 }
@@ -48,6 +50,7 @@ impl Session {
                         &source_path,
                         output,
                         on_conflict.unwrap_or(CompileConflict::LastWins),
+                        static_only,
                     ),
                     CompileTarget::Model => {
                         source_session.exec_compile_into_model(&source_path, output)

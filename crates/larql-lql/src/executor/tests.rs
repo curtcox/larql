@@ -5231,3 +5231,74 @@ fn compile_into_model_with_call_patch_returns_error() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn compile_into_vindex_with_call_patch_writes_sidecar() {
+    let (mut session, dir) = vindex_session("compile_vindex_call_sidecar");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+    let patch_path = write_call_patch_json(&dir, &gate);
+
+    let attach = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&patch_path)
+    ))
+    .unwrap();
+    session.execute(&attach).expect("ATTACH CALL");
+
+    let out_dir = dir.join("compiled.vindex");
+    let stmt = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO VINDEX "{}";"#,
+        lql_path(&out_dir)
+    ))
+    .unwrap();
+    let result = session.execute(&stmt);
+    assert!(
+        result.is_ok(),
+        "COMPILE INTO VINDEX with call patch should succeed: {result:?}"
+    );
+    let out_lines = result.unwrap();
+    let has_sidecar_warning = out_lines.iter().any(|l| l.contains("runtime_patches.vlp"));
+    assert!(
+        has_sidecar_warning,
+        "output should mention runtime_patches.vlp sidecar: {out_lines:?}"
+    );
+
+    let sidecar = out_dir.join("runtime_patches.vlp");
+    assert!(sidecar.exists(), "runtime_patches.vlp should be written");
+    let loaded = larql_vindex::VindexPatch::load(&sidecar).expect("load sidecar");
+    assert_eq!(
+        loaded.counts_detailed().calls,
+        1,
+        "sidecar should contain 1 call op"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_into_vindex_static_only_with_call_patch_returns_error() {
+    let (mut session, dir) = vindex_session("compile_vindex_static_only");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+    let patch_path = write_call_patch_json(&dir, &gate);
+
+    let attach = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&patch_path)
+    ))
+    .unwrap();
+    session.execute(&attach).expect("ATTACH CALL");
+
+    let out_dir = dir.join("compiled_static.vindex");
+    let stmt = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO VINDEX "{}" STATIC_ONLY;"#,
+        lql_path(&out_dir)
+    ))
+    .unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(
+        matches!(err, LqlError::Execution(_)),
+        "COMPILE INTO VINDEX STATIC_ONLY with call patch should fail: {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

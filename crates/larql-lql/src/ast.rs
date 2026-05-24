@@ -21,6 +21,8 @@ pub enum Statement {
         /// COMPILE INTO VINDEX only: how to resolve patches that touch the
         /// same (layer, feature) slot. None → default (LastWins).
         on_conflict: Option<CompileConflict>,
+        /// COMPILE INTO VINDEX STATIC_ONLY: reject (rather than sidecar) call patches.
+        static_only: bool,
     },
     Diff {
         a: VindexRef,
