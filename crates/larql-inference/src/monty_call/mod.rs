@@ -685,6 +685,7 @@ mod tests {
     fn runtime_runs_full_lifecycle_and_counts_metrics() {
         let mut call = call();
         call.safety.residual_clamp_norm = Some(1.0);
+        call.limits.time_us = 0;
         let ctx = CallContext {
             layer: 2,
             position: 0,

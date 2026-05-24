@@ -76,10 +76,11 @@ session, auto-starting an anonymous patch session like `INSERT` when needed.
 
 ## Compile Behavior
 
-`COMPILE INTO MODEL` rejects runtime call patches. `COMPILE INTO VINDEX` also
-rejects them until a deliberate `--include-runtime-patches` sidecar policy
-exists. This prevents producing artifacts that appear self-contained while
-silently dropping runtime behavior.
+`COMPILE INTO MODEL` rejects runtime call patches. `COMPILE INTO VINDEX`
+bakes static patch material into the output vindex and writes runtime call
+patches to `runtime_patches.vlp` as an explicit sidecar. This prevents
+producing artifacts that appear self-contained while silently dropping runtime
+behavior.
 
 ## Current Implementation Status
 
@@ -90,8 +91,9 @@ Implemented:
 - Call gate vectors participate in ordinary patched `gate_knn`.
 - `ATTACH CALL FROM FILE`.
 - Explicit compile rejection.
-- Inference-side trigger evaluation, input encoding, output decoding,
-  residual norm clamping, sparse logit-bias decoding, and an injectable
+- Inference-side trigger evaluation, raw residual and top-k basis input
+  encoding, raw residual and sparse basis delta output decoding, residual norm
+  clamping, sparse logit-bias decoding, and an injectable
   `MontyCallRuntime<R: CallProgramRunner>` lifecycle.
 - Opt-in sparse `WalkFfn` wiring for selected call patches. Call features are
   looked up after gate selection, executed through the installed runtime, and
@@ -100,6 +102,5 @@ Implemented:
 Not implemented yet:
 
 - Concrete Monty VM execution inside `larql-inference`.
-- Input/output codecs beyond persisted schema metadata.
 - Dense, Metal, full-mmap, and batched prefill call execution paths.
 - Inline `ATTACH CALL ... INPUT ... OUTPUT ... TRIGGER ...` grammar.
