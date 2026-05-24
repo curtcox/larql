@@ -15,7 +15,9 @@ pub use dequant::ensure_attn_tensors_dequantised;
 pub(crate) use kquant_forward::generate_kquant_cpu_constrained_streaming_sampled_with_eos;
 pub use kquant_forward::{
     attention_decode_step_native, ffn_decode_step_native, fused_decode_step,
-    fused_decode_step_with_state, fused_prefill, generate_kquant_cpu,
+    fused_decode_step_with_state, fused_prefill, fused_prefill_with_call_patches,
+    generate_kquant_cpu,
+    supports_fused_prefill_with_call_patches,
     generate_kquant_cpu_constrained, generate_kquant_cpu_constrained_streaming,
     generate_kquant_cpu_constrained_streaming_sampled, generate_kquant_cpu_remote,
     insert_q4k_layer_tensors, is_end_of_turn, kquant_ffn_forward_layer,

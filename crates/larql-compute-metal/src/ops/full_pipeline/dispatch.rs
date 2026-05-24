@@ -196,6 +196,10 @@ pub fn dispatch_full_pipeline(
     // fires so the closure can apply it correctly after combining dense + MoE.
     // Pass `None` for models without MoE — behaviour is identical to the prior API.
     mut moe_fn: Option<&mut dyn FnMut(usize, &[f32], &mut [f32])>,
+    // Optional per-layer CPU hook after dense FFN + residual add: `(layer,
+    // ffn_norm_out_flat, h_out_flat)` with `seq_len × hidden` row-major slices.
+    // Monty call patches score gates on the norm input and add deltas to `h_out`.
+    mut post_ffn_fn: Option<&mut dyn FnMut(usize, &[f32], &mut [f32])>,
     intervention: Option<&PipelineIntervention<'_>>,
 ) -> Vec<f32> {
     let num_layers = layers.len();
@@ -242,7 +246,8 @@ pub fn dispatch_full_pipeline(
     // expert block runs after each layer's dense FFN. When active, we commit
     // after every layer that has MoE (not once at the end), restart the
     // command buffer, and call the caller-supplied closure.
-    let needs_per_layer_commit = moe_fn.is_some() && layers.iter().any(|l| l.moe.is_some());
+    let needs_per_layer_commit = post_ffn_fn.is_some()
+        || (moe_fn.is_some() && layers.iter().any(|l| l.moe.is_some()));
 
     let mut cmd = queue.new_command_buffer().to_owned();
     let dump_path =
@@ -770,6 +775,14 @@ pub fn dispatch_full_pipeline(
                     let h = unsafe { std::slice::from_raw_parts_mut(h_ptr, seq_len * hidden) };
                     f(l, ha, h);
                 }
+            }
+
+            if let Some(ref mut f) = post_ffn_fn {
+                let norm_ptr = lb.ffn_norm_out[l].contents() as *const f32;
+                let h_ptr = lb.h[l + 1].contents() as *mut f32;
+                let norm = unsafe { std::slice::from_raw_parts(norm_ptr, seq_len * hidden) };
+                let h = unsafe { std::slice::from_raw_parts_mut(h_ptr, seq_len * hidden) };
+                f(l, norm, h);
             }
 
             if l < num_layers - 1 {

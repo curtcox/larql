@@ -20,7 +20,9 @@ mod walk_ffn;
 
 pub use cached::{
     attention_decode_step_native, ffn_decode_step_native, fused_decode_step,
-    fused_decode_step_with_state, fused_prefill, predict_kquant_decode_step,
+    fused_decode_step_with_state, fused_prefill, fused_prefill_with_call_patches,
+    predict_kquant_decode_step,
+    supports_fused_prefill_with_call_patches,
     predict_kquant_decode_step_direct, predict_kquant_decode_step_direct_with_state,
     predict_kquant_decode_step_with_call_patches, predict_kquant_prefill,
     predict_kquant_prefill_with_call_patches, predict_kquant_prefill_with_call_patches_and_state,

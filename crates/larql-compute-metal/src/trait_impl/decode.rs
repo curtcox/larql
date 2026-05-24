@@ -104,6 +104,7 @@ impl DecodeBackend for MetalBackend {
             use_qk_norm,
             softcap,
             None, // moe_fn: no MoE callback for full_pipeline_q4
+            None, // post_ffn_fn
             None, // intervention: no head replacement
         ))
     }
@@ -191,6 +192,7 @@ impl DecodeBackend for MetalBackend {
             use_qk_norm,
             softcap,
             None, // no MoE
+            None, // post_ffn_fn
             Some(&intervention),
         ))
     }
@@ -240,7 +242,7 @@ impl DecodeBackend for MetalBackend {
         // Concrete macro to avoid duplicating the 30-param dispatch call.
         // Second parameter is the optional PipelineIntervention for head replacement.
         macro_rules! run_dispatch {
-            ($moe_fn:expr, $intervention:expr) => {
+            ($moe_fn:expr, $post_ffn_fn:expr, $intervention:expr) => {
                 ops::full_pipeline::dispatch_full_pipeline(
                     &self.queue,
                     &self.bufs,
@@ -285,6 +287,7 @@ impl DecodeBackend for MetalBackend {
                     use_qk_norm,
                     softcap,
                     $moe_fn,
+                    $post_ffn_fn,
                     $intervention,
                 )
             };
@@ -349,11 +352,12 @@ impl DecodeBackend for MetalBackend {
             };
             return Some(run_dispatch!(
                 Some(&mut moe_closure as &mut dyn FnMut(usize, &[f32], &mut [f32])),
+                None,
                 None
             ));
         }
 
-        Some(run_dispatch!(None, None))
+        Some(run_dispatch!(None, None, None))
     }
 
     fn full_pipeline_kquant_capture_pre_wo(
@@ -438,6 +442,7 @@ impl DecodeBackend for MetalBackend {
             use_qk_norm,
             softcap,
             None,                // no MoE
+            None,                // post_ffn_fn
             Some(&intervention), // intervention fires at target_layer then stops
         );
         let captured = intervention.pre_wo_capture.into_inner();
@@ -541,6 +546,7 @@ impl DecodeBackend for MetalBackend {
             use_qk_norm,
             softcap,
             None,                // no MoE callback
+            None,                // post_ffn_fn
             Some(&intervention), // head replacement
         ))
     }

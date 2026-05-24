@@ -336,6 +336,28 @@ impl<'a> WalkFfn<'a> {
     /// Ranks are assigned among call patches sorted by descending score for each
     /// position, so `require_top_k = 1` (the default) fires only the
     /// highest-scoring call patch per position.
+    /// Apply call patches given row-major `seq_len × hidden` FFN norm inputs and
+    /// outputs. Used by the fused GPU prefill hook after readback from Metal.
+    pub fn apply_call_patches_to_buffers(
+        &self,
+        layer: usize,
+        seq_len: usize,
+        hidden: usize,
+        ffn_norm: &[f32],
+        h_out: &mut [f32],
+    ) {
+        if seq_len == 0 || hidden == 0 || ffn_norm.len() != seq_len * hidden || h_out.len() != seq_len * hidden
+        {
+            return;
+        }
+        let x = Array2::from_shape_vec((seq_len, hidden), ffn_norm.to_vec())
+            .expect("ffn_norm shape");
+        let mut out =
+            Array2::from_shape_vec((seq_len, hidden), h_out.to_vec()).expect("h_out shape");
+        self.apply_call_patches_dense(layer, &x, &mut out);
+        h_out.copy_from_slice(out.as_slice().unwrap());
+    }
+
     pub(super) fn apply_call_patches_dense(
         &self,
         layer: usize,

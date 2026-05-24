@@ -1007,6 +1007,95 @@ impl MetalBackend {
         result
     }
 
+    /// Fused Q4_K prefill with a per-layer CPU hook after dense FFN (Monty call patches).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_kquant_with_post_ffn_fn(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        seq_len: usize,
+        use_qk_norm: bool,
+        softcap: f32,
+        post_ffn_fn: &mut dyn FnMut(usize, &[f32], &mut [f32]),
+    ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            match layers.first() {
+                Some(l) => (
+                    l.num_q_heads * l.head_dim,
+                    l.num_kv_heads * l.head_dim,
+                    l.num_q_heads,
+                    l.num_kv_heads,
+                    l.head_dim,
+                    l.rope_base,
+                ),
+                None => (0, 0, 0, 0, 0, 0.0),
+            };
+
+        let mut cache_guard = self.kv_cache.lock().unwrap();
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut cache_guard,
+            layers,
+            DEFAULT_KV_CACHE_MAX_SEQ,
+        );
+        let geglu = if layers
+            .first()
+            .is_some_and(|l| l.activation == larql_compute::Activation::GeluTanh)
+        {
+            &self.ffn.geglu_gelu_tanh_pipeline
+        } else {
+            &self.ffn.geglu_pipeline
+        };
+        Some(ops::full_pipeline::dispatch_full_pipeline(
+            &self.queue,
+            &self.bufs,
+            &self.q4,
+            geglu,
+            &self.ffn.geglu_gelu_tanh_pipeline,
+            &self.ffn.silu_pipeline,
+            &self.ffn.gelu_tanh_pipeline,
+            &self.quant.q8_quant_pipeline,
+            Some(&self.attention.fused_attn_pipeline),
+            &self.quant.q8_matvec_pipeline.state,
+            &self.attention.q8_qkv_proj_pipeline.state,
+            &self.quant.q4k_matvec_pipeline,
+            Some(&self.quant.q4k_matmul_pipeline),
+            &self.quant.q6k_matvec_pipeline,
+            &self.norms.rms_norm_pipeline,
+            &self.norms.residual_add_pipeline,
+            &self.norms.rms_norm_q8_pipeline,
+            &self.norms.residual_norm_q8_pipeline,
+            Some(&self.attention.q4k_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_qkv_proj_pipeline.state),
+            Some(&self.attention.q4kf_proj_pipeline.state),
+            Some(&self.attention.rope_at_pos_pipeline),
+            Some(&self.norms.qk_norm_pipeline),
+            Some(&self.norms.scale_vector_pipeline),
+            Some(&self.ffn.q4k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q4k_geglu_gelu_tanh_down_pipeline),
+            Some(&self.ffn.q6k_geglu_silu_down_pipeline),
+            Some(&self.ffn.q6k_geglu_gelu_tanh_down_pipeline),
+            Some(kv),
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            use_qk_norm,
+            softcap,
+            None,
+            Some(post_ffn_fn),
+            None,
+        ))
+    }
+
     /// Local-expert path — delegates to `decode_token_with_moe_fn` with no hook.
     #[allow(clippy::too_many_arguments)]
     pub fn decode_token(

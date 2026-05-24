@@ -46,7 +46,7 @@ use crate::vindex::WalkFfn;
 use larql_vindex::PatchedVindex;
 use crate::forward::layer::apply_layer_scalar;
 use crate::forward::ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
-use crate::forward::run_ffn;
+use crate::forward::{run_ffn, run_layer_with_ffn};
 use crate::forward::{add_bias, apply_norm};
 use crate::residual::{rms_norm_heads, rms_norm_heads_no_weight};
 
@@ -90,12 +90,13 @@ pub fn supports_cached_decode(weights: &ModelWeights) -> bool {
 
 /// True when the KV-cached Q4K driver can run with a custom [`FfnBackend`]
 /// (e.g. [`crate::vindex::WalkFfn`] with call patches). Requires dense
-/// cached-decode eligibility plus Q4K tensor materialization on the index.
+/// architecture (no hybrid MoE), Q4K tensor materialization on the index,
+/// and cross-layer KV sharing support (Gemma 4 E2B-style shared layers).
 pub fn supports_kquant_cached_custom_ffn(weights: &ModelWeights, index: &VectorIndex) -> bool {
-    supports_cached_decode(weights)
-        && index
-            .attn_kquant_layer_data(0)
-            .is_some()
+    if weights.arch.is_hybrid_moe() {
+        return false;
+    }
+    index.attn_kquant_layer_data(0).is_some()
 }
 
 /// Prefill: run the full prompt through every layer once, capturing
@@ -228,25 +229,10 @@ pub fn predict_kquant_prefill_with_call_patches_and_state<
                 ));
         }
 
-        let (h_post_attn, k_rope, v_final) =
-            match run_attention_with_kv_backend(weights, &h, layer, None) {
-                Some(t) => t,
-                None => {
-                    remove_layer_tensors(weights, inserted);
-                    return (h, cache, timings);
-                }
-            };
-
-        if let Some(s) = state.as_deref_mut() {
-            s.k_new_per_layer
-                .push(larql_compute::state_handle::CpuStateHandle::boxed(
-                    k_rope.clone(),
-                ));
-            s.v_new_per_layer
-                .push(larql_compute::state_handle::CpuStateHandle::boxed(
-                    v_final.clone(),
-                ));
-        }
+        let shared_kv = weights
+            .arch
+            .kv_shared_source_layer(layer)
+            .and_then(|src| cache[src].as_ref());
 
         let mut walk_ffn = WalkFfn::from_config(weights, ctx.patched, ctx.config.clone())
             .with_call_patches(ctx.patched)
@@ -255,14 +241,41 @@ pub fn predict_kquant_prefill_with_call_patches_and_state<
             walk_ffn = walk_ffn.with_backend(be);
         }
         walk_ffn.set_call_position_base(ctx.call_position_base);
-        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
-        let mut h_out =
-            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
-        apply_layer_scalar(weights, &mut h_out, layer);
+
+        let (h_out, _, kv_out) = match run_layer_with_ffn(
+            weights,
+            &h,
+            layer,
+            &walk_ffn,
+            false,
+            ple_inputs.get(layer),
+            shared_kv,
+        ) {
+            Some(t) => t,
+            None => {
+                remove_layer_tensors(weights, inserted);
+                return (h, cache, timings);
+            }
+        };
+
+        if let Some(s) = state.as_deref_mut() {
+            if let Some((k_rope, v_final)) = kv_out.as_ref() {
+                s.k_new_per_layer
+                    .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                        k_rope.clone(),
+                    ));
+                s.v_new_per_layer
+                    .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                        v_final.clone(),
+                    ));
+            }
+        }
 
         remove_layer_tensors(weights, inserted);
 
-        cache[layer] = Some((k_rope, v_final));
+        if let Some(kv) = kv_out {
+            cache[layer] = Some(kv);
+        }
         h = h_out;
     }
 
@@ -352,23 +365,6 @@ pub fn predict_kquant_decode_step_with_call_patches<R: crate::monty_call::CallPr
             .unwrap_or_else(|err| panic!("{err}"));
         timings.dequant_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
-        let kv_entry = cache[layer].as_ref();
-        let (h_post_attn, new_kv) = match run_attention_block_decode_step_backend(
-            weights,
-            &h,
-            layer,
-            kv_entry,
-            abs_position,
-            ctx.matmul_backend,
-        ) {
-            Some(t) => t,
-            None => {
-                remove_layer_tensors(weights, inserted);
-                return None;
-            }
-        };
-        cache[layer] = Some(new_kv);
-
         let mut walk_ffn = WalkFfn::from_config(weights, ctx.patched, ctx.config.clone())
             .with_call_patches(ctx.patched)
             .with_call_runtime(ctx.runtime as &dyn WalkCallRuntime);
@@ -376,6 +372,47 @@ pub fn predict_kquant_decode_step_with_call_patches<R: crate::monty_call::CallPr
             walk_ffn = walk_ffn.with_backend(be);
         }
         walk_ffn.set_call_position_base(ctx.call_position_base);
+
+        let shared_kv = weights
+            .arch
+            .kv_shared_source_layer(layer)
+            .and_then(|src| cache[src].as_ref());
+
+        let h_post_attn = if let Some(shared) = shared_kv {
+            match larql_compute::attention::run_attention_block_decode_step_shared(
+                weights,
+                &h,
+                layer,
+                shared,
+                abs_position,
+                ctx.matmul_backend,
+            ) {
+                Some(h_pa) => h_pa,
+                None => {
+                    remove_layer_tensors(weights, inserted);
+                    return None;
+                }
+            }
+        } else {
+            let kv_entry = cache[layer].as_ref();
+            let (h_post_attn, new_kv) = match run_attention_block_decode_step_backend(
+                weights,
+                &h,
+                layer,
+                kv_entry,
+                abs_position,
+                ctx.matmul_backend,
+            ) {
+                Some(t) => t,
+                None => {
+                    remove_layer_tensors(weights, inserted);
+                    return None;
+                }
+            };
+            cache[layer] = Some(new_kv);
+            h_post_attn
+        };
+
         let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
         let mut h_out =
             apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
@@ -607,6 +644,147 @@ pub fn fused_prefill(
     let h_2d = Array2::from_shape_vec((seq_len, hidden), h_vec).ok()?;
     let last = h_2d.shape()[0] - 1;
     Some(h_2d.slice(ndarray::s![last..=last, ..]).to_owned())
+}
+
+/// True when [`fused_prefill_with_call_patches`] can run (GPU Q4_K prefill +
+/// Monty call-patch hook).
+pub fn supports_fused_prefill_with_call_patches(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    patched: &PatchedVindex,
+    backend: &dyn ComputeBackend,
+) -> bool {
+    use larql_vindex::GateIndex;
+
+    if weights.arch.is_hybrid_moe() || !backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
+        return false;
+    }
+    let gate_index: &dyn GateIndex = index;
+    if gate_index.interleaved_kquant_mmap_ref().is_none()
+        && gate_index.interleaved_q4_mmap_ref().is_none()
+    {
+        return false;
+    }
+    if index.attn_kquant_layer_data(0).is_none() {
+        return false;
+    }
+    (0..weights.num_layers).any(|l| !patched.call_patches_for_layer(l).is_empty())
+}
+
+/// Metal-fused batched prefill with Monty call patches applied per layer after
+/// the GPU FFN completes. Falls back to [`fused_prefill`] when no call patches
+/// are loaded. Returns `None` when the backend is not Metal or the vindex shape
+/// is unsupported.
+pub fn fused_prefill_with_call_patches<R: crate::monty_call::CallProgramRunner>(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_ids: &[u32],
+    backend: &dyn ComputeBackend,
+    ctx: &KquantCallPatchCtx<'_, R>,
+) -> Option<Array2<f32>> {
+    let has_call_patches = (0..weights.num_layers)
+        .any(|l| !ctx.patched.call_patches_for_layer(l).is_empty());
+    if !has_call_patches {
+        return fused_prefill(weights, index, token_ids, backend);
+    }
+    if !supports_fused_prefill_with_call_patches(weights, index, ctx.patched, backend) {
+        return None;
+    }
+
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    {
+        use crate::layer_graph::pipeline_layer::{build_pipeline_layers, DEFAULT_GPU_KV_CACHE_MAX_SEQ};
+        use larql_vindex::GateIndex;
+        use larql_compute::backend::DecodeBackend;
+
+        let metal_be = backend
+            .as_any()
+            .downcast_ref::<larql_compute_metal::MetalBackend>()?;
+
+        let gate_index: &dyn GateIndex = index;
+        let (q4_ffn_mmap, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_kquant_mmap_ref() {
+            (m, true)
+        } else if let Some(m) = gate_index.interleaved_q4_mmap_ref() {
+            (m, false)
+        } else {
+            return None;
+        };
+
+        let hidden = weights.hidden_size;
+        let num_layers = weights.num_layers;
+        let intermediate = gate_index.num_features(0);
+        if intermediate == 0 {
+            return None;
+        }
+
+        let ffn_format = if ffn_is_q4k {
+            larql_compute::QuantFormat::Q4_K
+        } else {
+            larql_compute::QuantFormat::Q4_0
+        };
+        let q4_ffn_per_matrix = ffn_format.packed_matrix_bytes(intermediate, hidden)?;
+
+        let layers = build_pipeline_layers(
+            weights,
+            index,
+            0..num_layers,
+            q4_ffn_mmap,
+            q4_ffn_per_matrix,
+            ffn_format,
+        );
+
+        let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
+        let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
+        let seq_len = token_ids.len();
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+        let qk_norm = weights.arch.attn_q_norm_key(0).is_some();
+
+        metal_be.reset_kv_cache();
+        {
+            let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
+                .map(|l| {
+                    (
+                        weights.arch.num_kv_heads_for_layer(l),
+                        weights.arch.head_dim_for_layer(l),
+                    )
+                })
+                .collect();
+            metal_be.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
+        }
+
+        let mut walk_ffn = WalkFfn::from_config(weights, ctx.patched, ctx.config.clone())
+            .with_call_patches(ctx.patched)
+            .with_call_runtime(ctx.runtime as &dyn WalkCallRuntime);
+        if let Some(be) = ctx.matmul_backend {
+            walk_ffn = walk_ffn.with_backend(be);
+        }
+        walk_ffn.set_call_position_base(ctx.call_position_base);
+
+        let mut post_ffn = |layer: usize, ffn_norm: &[f32], h_out: &mut [f32]| {
+            walk_ffn.apply_call_patches_to_buffers(layer, seq_len, hidden, ffn_norm, h_out);
+        };
+
+        let h_vec = metal_be.prefill_kquant_with_post_ffn_fn(
+            &layers,
+            &x,
+            hidden,
+            intermediate,
+            seq_len,
+            qk_norm,
+            softcap,
+            &mut post_ffn,
+        )?;
+
+        let h_2d = Array2::from_shape_vec((seq_len, hidden), h_vec).ok()?;
+        let last = h_2d.shape()[0] - 1;
+        return Some(h_2d.slice(ndarray::s![last..=last, ..]).to_owned());
+    }
+
+    #[cfg(not(all(feature = "gpu", target_os = "macos")))]
+    {
+        let _ = (weights, index, token_ids, backend, ctx);
+        None
+    }
 }
 
 /// Metal-fused single-token decode: run one token through all layers via

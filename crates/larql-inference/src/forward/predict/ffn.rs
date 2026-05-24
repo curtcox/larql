@@ -601,16 +601,29 @@ fn kv_decode_step_with_call_ffn(
     let ple_inputs = precompute_per_layer_inputs(weights, &h_new, &[token_id]);
     let mut h_step = h_new;
     for layer in 0..num_layers {
-        let prior_kv = kv_cache.get(&layer);
-        let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
-            weights,
-            &h_step,
-            layer,
-            prior_kv,
-            abs_position,
-            ffn.backend,
-        )?;
-        kv_cache.insert(layer, new_kv);
+        let h_post_attn = if let Some(src) = weights.arch.kv_shared_source_layer(layer) {
+            let shared = kv_cache.get(&src)?;
+            larql_compute::attention::run_attention_block_decode_step_shared(
+                weights,
+                &h_step,
+                layer,
+                shared,
+                abs_position,
+                ffn.backend,
+            )?
+        } else {
+            let prior_kv = kv_cache.get(&layer);
+            let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
+                weights,
+                &h_step,
+                layer,
+                prior_kv,
+                abs_position,
+                ffn.backend,
+            )?;
+            kv_cache.insert(layer, new_kv);
+            h_post_attn
+        };
         let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
         let mut h_out =
             apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
@@ -991,6 +1004,29 @@ mod tests {
             result.trace_events.iter().any(|e| matches!(e.outcome, CallOutcome::Fired)),
             "at least one Fired event expected"
         );
+    }
+
+    #[test]
+    fn kv_decode_step_with_call_ffn_handles_kv_shared_layers() {
+        use larql_models::test_fixtures::make_synthetic_e2b_like_weights;
+
+        let weights = make_synthetic_e2b_like_weights();
+        let hidden = weights.hidden_size;
+        let index = larql_vindex::VectorIndex::new(
+            vec![None; weights.num_layers],
+            vec![None; weights.num_layers],
+            weights.num_layers,
+            hidden,
+        );
+        let patched = larql_vindex::PatchedVindex::new(index);
+        let ffn = WalkFfn::from_config(&weights, &patched, WalkFfnConfig::sparse(4, 1));
+
+        let (_, mut kv_cache, _) =
+            kv_prefill_with_call_ffn(&weights, &[0u32, 1], &ffn).expect("prefill");
+        let h_step = kv_decode_step_with_call_ffn(&weights, &ffn, &mut kv_cache, 2, 2)
+            .expect("decode on kv-shared arch");
+        assert_eq!(h_step.shape(), &[1, hidden]);
+        assert!(h_step.iter().all(|v| v.is_finite()));
     }
 
     #[test]

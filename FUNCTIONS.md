@@ -14,9 +14,8 @@ This document is now split into two readings:
   via the `apply_call_patches_dense` post-processing step), Metal/GPU walk path
   wiring (interleaved Q4 Metal/CPU, sparse full-K gemv, parallel Q4K down, and
   optional backend on public predict/generate helpers).
-* **Remaining**: fused GPU `prefill_kquant` with call patches, cross-layer KV
-  sharing on the generation path, production safety hardening, benchmarks, and
-  the training pipeline.
+* **Remaining**: fused GPU `decode_token` with call patches (prefill hook is
+  wired), production safety hardening, benchmarks, and the training pipeline.
 
 Already implemented in-tree
 
@@ -99,8 +98,8 @@ Multi-token generation with call patches is now implemented via
 state once at the start, and return `GenerateResultWithCallMetrics` with
 aggregate `call_metrics` and optional per-event `trace_events`.
 
-The next highest-leverage step is fused GPU `prefill_kquant` with call patches
-and cross-layer KV sharing on the generation path.
+The next highest-leverage step is fused GPU `decode_token` with call patches so
+`generate_with_call_patches` can stay on the Metal KV cache end-to-end.
 
 Reading note
 
@@ -248,12 +247,31 @@ KV-cached Q4K batched prefill with call patches — complete:
 * `prefill_with_kv_ffn` and `PipelinedLayerGraph::ffn` support batched multi-token
   prefill with a caller-supplied FFN backend.
 
+KV-cached call-patch generation with cross-layer KV sharing — complete:
+
+* `run_attention_block_decode_step_shared` for single-token decode on layers that
+  reuse another layer's K/V (Gemma 4 E2B).
+* `kv_decode_step_with_call_ffn` routes shared layers through that path instead of
+  appending bogus per-layer K/V.
+* `predict_kquant_prefill_with_call_patches` uses `run_layer_with_ffn` + shared KV
+  at prefill; `predict_kquant_decode_step_with_call_patches` uses the shared
+  decode path.
+* `supports_kquant_cached_custom_ffn` no longer rejects architectures with
+  `kv_shared_source_layer`.
+
+Fused GPU `prefill_kquant` with call patches — complete (prefill only):
+
+* Metal `dispatch_full_pipeline` accepts `post_ffn_fn` (per-layer CPU hook after
+  dense FFN, same commit pattern as hybrid MoE).
+* `MetalBackend::prefill_kquant_with_post_ffn_fn` runs fused prefill with the hook.
+* `fused_prefill_with_call_patches` / `supports_fused_prefill_with_call_patches`
+  apply Monty call patches via `WalkFfn::apply_call_patches_to_buffers` on GPU
+  readback (requires `gpu` feature + Metal backend).
+
 Still incomplete:
 
-* Fused GPU `prefill_kquant` kernel path with call patches.
-* Cross-layer KV sharing on the call-patch generation path (same constraint as
-  `supports_cached_decode` — architectures with `kv_shared_source_layer` need
-  a dedicated path).
+* Fused GPU `decode_token` with call patches (decode steps in
+  `generate_with_call_patches` still use the CPU Q4K cached driver).
 
 ⸻
 
