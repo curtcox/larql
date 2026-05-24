@@ -11,6 +11,10 @@ use larql_vindex::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -29,6 +33,10 @@ pub enum CallError {
     ExpectedNumber(String),
     #[error("invalid sparse logit bias: {0}")]
     InvalidLogitBias(String),
+    #[error("failed to run Monty call program: {0}")]
+    ProgramRun(String),
+    #[error("failed to encode Monty output as JSON: {0}")]
+    OutputJson(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +94,105 @@ pub struct MontyCallMetrics {
 pub trait CallProgramRunner {
     fn run(&mut self, call: &CallPatchOp, input: Value) -> Result<Value, CallError>;
 }
+
+/// Concrete Monty VM-backed runner for runtime call patches.
+///
+/// Call patch source is authored as a `def main(input): ...` function. The
+/// runner appends a tiny top-level `main(input)` entrypoint, then executes it
+/// through the `pydantic_monty` Python package with a single JSON-like input
+/// object. Set `LARQL_MONTY_PYTHON` to choose the Python interpreter.
+#[derive(Debug, Clone)]
+pub struct MontyVmRunner {
+    python: String,
+}
+
+impl MontyVmRunner {
+    pub fn new() -> Self {
+        Self {
+            python: std::env::var("LARQL_MONTY_PYTHON").unwrap_or_else(|_| "python3".into()),
+        }
+    }
+
+    pub fn with_python(python: impl Into<String>) -> Self {
+        Self {
+            python: python.into(),
+        }
+    }
+}
+
+impl Default for MontyVmRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CallProgramRunner for MontyVmRunner {
+    fn run(&mut self, call: &CallPatchOp, input: Value) -> Result<Value, CallError> {
+        let payload = json!({
+            "code": monty_entrypoint_code(&call.monty_code),
+            "input": input,
+        });
+        let mut child = Command::new(&self.python)
+            .arg("-c")
+            .arg(MONTY_SUBPROCESS_DRIVER)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| CallError::ProgramRun(format!("failed to start {}: {e}", self.python)))?;
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| CallError::ProgramRun("failed to open Monty stdin".into()))?;
+            let bytes =
+                serde_json::to_vec(&payload).map_err(|e| CallError::OutputJson(e.to_string()))?;
+            stdin
+                .write_all(&bytes)
+                .map_err(|e| CallError::ProgramRun(format!("failed to write Monty input: {e}")))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| CallError::ProgramRun(format!("failed to wait for Monty: {e}")))?;
+        if !output.status.success() {
+            return Err(CallError::ProgramRun(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        serde_json::from_slice(&output.stdout).map_err(|e| {
+            CallError::OutputJson(format!("{e}: {}", String::from_utf8_lossy(&output.stdout)))
+        })
+    }
+}
+
+fn monty_entrypoint_code(source: &str) -> String {
+    let mut code = source.trim_end().to_string();
+    code.push_str("\n\nmain(input)\n");
+    code
+}
+
+const MONTY_SUBPROCESS_DRIVER: &str = r#"
+import asyncio
+import json
+import sys
+
+import pydantic_monty
+
+payload = json.load(sys.stdin)
+runner = pydantic_monty.Monty(
+    payload["code"],
+    inputs=["input"],
+    script_name="larql_call_patch.py",
+    type_check=False,
+)
+
+async def _run():
+    if hasattr(runner, "run_async"):
+        return await runner.run_async(inputs={"input": payload["input"]})
+    return runner.run(inputs={"input": payload["input"]})
+
+print(json.dumps(asyncio.run(_run()), separators=(",", ":")))
+"#;
 
 pub trait CallPatchLookup {
     fn call_patch(&self, layer: usize, feature: usize) -> Option<&CallPatchOp>;
@@ -1177,6 +1284,23 @@ mod tests {
         assert!(
             !indices.contains(&2),
             "idx 2 (score 1) should not be in top-2"
+        );
+    }
+
+    #[test]
+    fn monty_entrypoint_wraps_main_function() {
+        let code = monty_entrypoint_code("def main(input):\n    return input\n");
+        assert!(code.contains("def main(input):"));
+        assert!(code.ends_with("\n\nmain(input)\n"));
+    }
+
+    #[test]
+    fn monty_vm_runner_reports_process_start_failure() {
+        let mut runner = MontyVmRunner::with_python("__larql_missing_python__");
+        let err = runner.run(&call(), json!({"residual": [1.0, 2.0, 3.0]}));
+        assert!(
+            matches!(err, Err(CallError::ProgramRun(_))),
+            "expected ProgramRun for missing interpreter, got {err:?}"
         );
     }
 }
