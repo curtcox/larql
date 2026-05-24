@@ -90,9 +90,12 @@ Implemented:
 - Call gate vectors participate in ordinary patched `gate_knn`.
 - `ATTACH CALL FROM FILE`.
 - Explicit compile rejection.
+- Inference-side trigger evaluation, input encoding, output decoding,
+  residual norm clamping, sparse logit-bias decoding, and an injectable
+  `MontyCallRuntime<R: CallProgramRunner>` lifecycle.
 
 Not implemented yet:
 
-- Monty execution inside `larql-inference`.
+- Concrete Monty VM execution inside `larql-inference`.
 - Input/output codecs beyond persisted schema metadata.
 - Inline `ATTACH CALL ... INPUT ... OUTPUT ... TRIGGER ...` grammar.
