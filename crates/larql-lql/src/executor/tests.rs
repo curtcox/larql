@@ -5040,6 +5040,76 @@ fn attach_call_from_file_registers_call_patch() {
 }
 
 #[test]
+fn attach_call_inline_registers_call_patch() {
+    let (mut session, dir) = vindex_session("attach_call_inline");
+    let gate_path = dir.join("gate.f32");
+    let code_path = dir.join("normalize.py");
+    std::fs::write(&gate_path, "1.0, 0.0, 0.0, 0.0").unwrap();
+    std::fs::write(&code_path, "def main(input):\n    return input\n").unwrap();
+
+    let stmt = parser::parse(&format!(
+        r#"ATTACH CALL
+           AT LAYER 0 FEATURE 2
+           GATE VECTOR FROM FILE "{}"
+           MONTY CODE FROM FILE "{}"
+           TRIGGER SCORE >= 0.5 MAX_CALLS_PER_TOKEN 1
+           LIMITS TIME_US 250 MEMORY_BYTES 1048576 STEPS 10000;"#,
+        lql_path(&gate_path),
+        lql_path(&code_path)
+    ))
+    .unwrap();
+    let out = session
+        .execute(&stmt)
+        .expect("ATTACH CALL inline should succeed");
+    assert!(
+        out.join("\n").contains("L0 F2"),
+        "expected inline attach output to include L0 F2"
+    );
+
+    let overlay = session.patched_overlay_mut().expect("vindex backend");
+    let call = overlay
+        .call_patch(0, 2)
+        .expect("call patch should be registered");
+    assert_eq!(call.trigger.score_threshold, Some(0.5));
+    assert!(call
+        .code_hash
+        .as_deref()
+        .unwrap_or("")
+        .starts_with("sha256:"));
+    assert!(
+        overlay.overrides_gate_at(0, 2).is_some(),
+        "gate vector should be registered for inline call"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_call_inline_invalid_gate_vector_returns_error() {
+    let (mut session, dir) = vindex_session("attach_call_inline_bad_gate");
+    let gate_path = dir.join("gate.f32");
+    let code_path = dir.join("normalize.py");
+    std::fs::write(&gate_path, "1.0 nope").unwrap();
+    std::fs::write(&code_path, "def main(input):\n    return input\n").unwrap();
+
+    let stmt = parser::parse(&format!(
+        r#"ATTACH CALL AT LAYER 0 FEATURE 2
+           GATE VECTOR FROM FILE "{}"
+           MONTY CODE FROM FILE "{}";"#,
+        lql_path(&gate_path),
+        lql_path(&code_path)
+    ))
+    .unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid f32 value"),
+        "bad gate vector should mention invalid f32: {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn attach_call_adds_op_to_recording_when_active() {
     let (mut session, dir) = vindex_session("attach_call_recording");
     let gate = vec![1.0f32, 0.0, 0.0, 0.0];

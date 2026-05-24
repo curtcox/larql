@@ -1786,7 +1786,12 @@ fn parse_compile_into_model_explicit() {
 fn parse_compile_into_vindex_static_only() {
     let stmt = parse(r#"COMPILE CURRENT INTO VINDEX "out.vindex" STATIC_ONLY;"#).unwrap();
     match stmt {
-        Statement::Compile { target, static_only, on_conflict, .. } => {
+        Statement::Compile {
+            target,
+            static_only,
+            on_conflict,
+            ..
+        } => {
             assert_eq!(target, CompileTarget::Vindex);
             assert!(static_only, "STATIC_ONLY flag should be true");
             assert_eq!(on_conflict, None);
@@ -1801,7 +1806,11 @@ fn parse_compile_into_vindex_static_only_with_on_conflict() {
         parse(r#"COMPILE CURRENT INTO VINDEX "out.vindex" ON CONFLICT LAST_WINS STATIC_ONLY;"#)
             .unwrap();
     match stmt {
-        Statement::Compile { static_only, on_conflict, .. } => {
+        Statement::Compile {
+            static_only,
+            on_conflict,
+            ..
+        } => {
             assert!(static_only);
             assert_eq!(on_conflict, Some(CompileConflict::LastWins));
         }
@@ -1937,6 +1946,34 @@ fn parse_attach_call_from_file() {
     match stmt {
         Statement::AttachCall { path } => assert_eq!(path, "call_patch.json"),
         _ => panic!("expected AttachCall"),
+    }
+}
+
+#[test]
+fn parse_attach_call_inline_from_files() {
+    let stmt = parse(
+        r#"ATTACH CALL
+           AT LAYER 2 FEATURE 7
+           GATE VECTOR FROM FILE "gate.f32"
+           MONTY CODE FROM FILE "normalize.py"
+           TRIGGER SCORE >= 12.5 MARGIN >= 2 MAX_CALLS_PER_TOKEN 1
+           LIMITS TIME_US 250 MEMORY_BYTES 1048576 STEPS 10000;"#,
+    )
+    .unwrap();
+    match stmt {
+        Statement::AttachCallInline(call) => {
+            assert_eq!(call.layer, 2);
+            assert_eq!(call.feature, 7);
+            assert_eq!(call.gate_vector_path, "gate.f32");
+            assert_eq!(call.monty_code_path, "normalize.py");
+            assert_eq!(call.score_threshold, Some(12.5));
+            assert_eq!(call.margin_threshold, Some(2.0));
+            assert_eq!(call.max_calls_per_token, Some(1));
+            assert_eq!(call.time_us, Some(250));
+            assert_eq!(call.memory_bytes, Some(1_048_576));
+            assert_eq!(call.steps, Some(10_000));
+        }
+        _ => panic!("expected AttachCallInline"),
     }
 }
 

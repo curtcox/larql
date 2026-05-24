@@ -169,6 +169,7 @@ pub enum Statement {
     AttachCall {
         path: String,
     },
+    AttachCallInline(AttachCallInline),
 
     // ── Trace ──
     /// Residual stream trace — decomposed forward pass.
@@ -187,6 +188,20 @@ pub enum Statement {
         left: Box<Statement>,
         right: Box<Statement>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct AttachCallInline {
+    pub layer: usize,
+    pub feature: usize,
+    pub gate_vector_path: String,
+    pub monty_code_path: String,
+    pub score_threshold: Option<f32>,
+    pub margin_threshold: Option<f32>,
+    pub max_calls_per_token: Option<usize>,
+    pub time_us: Option<u64>,
+    pub memory_bytes: Option<u64>,
+    pub steps: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

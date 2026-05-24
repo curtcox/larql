@@ -275,6 +275,12 @@ impl Session {
                 self.advance_epoch();
                 Ok(out)
             }
+            Statement::AttachCallInline(inline) => {
+                let mut out = self.ensure_patch_session();
+                out.extend(self.exec_attach_call_inline(inline)?);
+                self.advance_epoch();
+                Ok(out)
+            }
             // ── Trace commands ──
             Statement::Trace {
                 prompt,
@@ -329,7 +335,7 @@ impl Session {
             Statement::ApplyPatch { path } => self.remote_apply_local_patch(path),
             Statement::ShowPatches => self.remote_show_patches(),
             Statement::RemovePatch { path } => self.remote_remove_local_patch(path),
-            Statement::AttachCall { .. } => Err(LqlError::Execution(
+            Statement::AttachCall { .. } | Statement::AttachCallInline(_) => Err(LqlError::Execution(
                 "ATTACH CALL requires a local vindex backend".into(),
             )),
             Statement::Pipe { left, right } => {
@@ -566,6 +572,82 @@ impl Session {
         )])
     }
 
+    fn exec_attach_call_inline(
+        &mut self,
+        inline: &AttachCallInline,
+    ) -> Result<Vec<String>, LqlError> {
+        let gate_vec = read_f32_vector_file(&inline.gate_vector_path)?;
+        let monty_code = std::fs::read_to_string(&inline.monty_code_path).map_err(|e| {
+            LqlError::Execution(format!(
+                "failed to read Monty code {}: {e}",
+                inline.monty_code_path
+            ))
+        })?;
+
+        let mut call = larql_vindex::CallPatchOp {
+            layer: inline.layer,
+            feature: inline.feature,
+            gate_vector_b64: Some(larql_vindex::patch::format::encode_gate_vector(&gate_vec)),
+            monty_code,
+            code_hash: None,
+            input_schema: serde_json::json!({
+                "sources": [{"kind": "current_residual", "key": "residual", "codec": {"kind": "raw_f32"}}],
+                "include_token_ids": true,
+                "include_token_text": true
+            }),
+            output_schema: serde_json::json!({
+                "sinks": [{"kind": "residual_delta", "key": "residual_delta", "codec": {"kind": "raw_f32"}}]
+            }),
+            trigger: larql_vindex::CallTrigger {
+                score_threshold: inline.score_threshold,
+                margin_threshold: inline.margin_threshold,
+                max_calls_per_token: inline.max_calls_per_token.unwrap_or(1),
+                max_calls_per_sequence: None,
+                cooldown_tokens: None,
+                require_top_k: 1,
+            },
+            limits: larql_vindex::CallResourceLimits {
+                time_us: inline.time_us.unwrap_or(250),
+                memory_bytes: inline.memory_bytes.unwrap_or(1_048_576),
+                steps: inline.steps.unwrap_or(10_000),
+            },
+            safety: larql_vindex::CallSafetyPolicy::default(),
+            metadata: serde_json::json!({
+                "source": "lql_inline",
+                "gate_vector_path": inline.gate_vector_path,
+                "monty_code_path": inline.monty_code_path
+            }),
+        };
+        validate_call_patch_code(&call)?;
+        call.ensure_code_hash();
+
+        match &mut self.backend {
+            Backend::Vindex { patched, .. } => {
+                let hidden = patched.hidden_size();
+                if hidden > 0 && gate_vec.len() != hidden {
+                    return Err(LqlError::Execution(format!(
+                        "call gate vector has dim {}, expected hidden size {}",
+                        gate_vec.len(),
+                        hidden
+                    )));
+                }
+                patched.insert_call_patch(call.clone(), gate_vec);
+            }
+            _ => return Err(LqlError::NoBackend),
+        }
+
+        if let Some(recording) = &mut self.patch_recording {
+            recording
+                .operations
+                .push(larql_vindex::PatchOp::Call(call.clone()));
+        }
+
+        Ok(vec![format!(
+            "Attached call patch: L{} F{} from inline files",
+            call.layer, call.feature
+        )])
+    }
+
     /// Bump the LSM epoch + minor/major mutation counters. Called after
     /// every INSERT/DELETE/UPDATE.
     pub(crate) fn advance_epoch(&mut self) {
@@ -573,6 +655,28 @@ impl Session {
         self.mutations_since_minor += 1;
         self.mutations_since_major += 1;
     }
+}
+
+fn read_f32_vector_file(path: &str) -> Result<Vec<f32>, LqlError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| LqlError::Execution(format!("failed to read gate vector {path}: {e}")))?;
+    let mut out = Vec::new();
+    for part in text.split(|c: char| c.is_ascii_whitespace() || c == ',') {
+        if part.is_empty() {
+            continue;
+        }
+        out.push(part.parse::<f32>().map_err(|e| {
+            LqlError::Execution(format!(
+                "invalid f32 value {part:?} in gate vector {path}: {e}"
+            ))
+        })?);
+    }
+    if out.is_empty() {
+        return Err(LqlError::Execution(format!(
+            "gate vector file is empty: {path}"
+        )));
+    }
+    Ok(out)
 }
 
 fn parse_call_patch_op(text: &str) -> Result<larql_vindex::PatchOp, LqlError> {
