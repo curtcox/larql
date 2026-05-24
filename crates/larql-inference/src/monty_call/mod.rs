@@ -67,6 +67,10 @@ pub struct MontyCallMetrics {
     pub fired: u64,
     pub skipped: u64,
     pub failed: u64,
+    /// Calls that completed but exceeded their `time_us` budget.
+    /// The output is discarded and the position is treated as if the
+    /// call was not fired (output zeroed, metric incremented).
+    pub timed_out: u64,
 }
 
 pub trait CallProgramRunner {
@@ -131,6 +135,7 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
         }
 
         let input = encode_input(call, ctx);
+        let t0 = std::time::Instant::now();
         let raw = match self.runner.run(call, input) {
             Ok(raw) => raw,
             Err(err) => {
@@ -138,6 +143,12 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
                 return Err(err);
             }
         };
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        if call.limits.time_us > 0 && elapsed_us > call.limits.time_us {
+            self.metrics.timed_out += 1;
+            self.metrics.skipped += 1;
+            return Ok(None);
+        }
 
         let mut output = match decode_output(call, &raw, hidden_size) {
             Ok(output) => output,
@@ -339,6 +350,18 @@ mod tests {
     impl CallProgramRunner for StaticRunner {
         fn run(&mut self, _call: &CallPatchOp, input: Value) -> Result<Value, CallError> {
             assert_eq!(input["residual"], json!([1.0, 2.0, 3.0]));
+            Ok(self.output.clone())
+        }
+    }
+
+    struct SlowRunner {
+        sleep_us: u64,
+        output: Value,
+    }
+
+    impl CallProgramRunner for SlowRunner {
+        fn run(&mut self, _call: &CallPatchOp, _input: Value) -> Result<Value, CallError> {
+            std::thread::sleep(std::time::Duration::from_micros(self.sleep_us));
             Ok(self.output.clone())
         }
     }
@@ -589,5 +612,84 @@ mod tests {
             }
         ));
         drop(trigger);
+    }
+
+    #[test]
+    fn runtime_counts_timeout_when_call_exceeds_time_budget() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        // 1 µs budget — any real sleep will exceed this.
+        call.limits.time_us = 1;
+
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(SlowRunner {
+            sleep_us: 2_000, // 2 ms, well over 1 µs budget
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        });
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        assert!(output.is_none(), "timed-out call should return None");
+        assert_eq!(runtime.metrics().timed_out, 1);
+        assert_eq!(runtime.metrics().skipped, 1);
+        assert_eq!(runtime.metrics().fired, 0);
+    }
+
+    #[test]
+    fn runtime_fires_when_within_time_budget() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        // Very generous budget — should never time out.
+        call.limits.time_us = 1_000_000;
+
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        });
+
+        let output = runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap()
+            .expect("should fire within budget");
+
+        assert!(output.residual_delta.is_some());
+        assert_eq!(runtime.metrics().fired, 1);
+        assert_eq!(runtime.metrics().timed_out, 0);
     }
 }
