@@ -17,3 +17,4 @@ All specs live with the crate they describe.
 | `larql confidence` (slot bits) | larql-cli | [crates/larql-cli/docs/slot-bits-spec.md](../crates/larql-cli/docs/slot-bits-spec.md) |
 | Trace format | larql-inference | [crates/larql-inference/docs/trace-format.md](../crates/larql-inference/docs/trace-format.md) |
 | Vindex-as-FFN lookup | larql-inference | [crates/larql-inference/docs/specs/vindex-as-ffn.md](../crates/larql-inference/docs/specs/vindex-as-ffn.md) |
+| Monty call patches | larql-vindex / larql-lql / larql-inference | [docs/monty-call-patches.md](monty-call-patches.md) |

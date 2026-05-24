@@ -162,6 +162,19 @@ REMOVE PATCH "fix-hallucinations.vlp";
 DIFF "base.vindex" "edited.vindex" INTO PATCH "changes.vlp";
 ```
 
+Runtime call patches are an experimental overlay form for attaching a bounded
+function call to a gate slot. The implemented syntax is file-backed:
+
+```sql
+BEGIN PATCH "tools.vlp";
+ATTACH CALL FROM FILE "normalize-call.json";
+SAVE PATCH;
+```
+
+Call patches are runtime artifacts. They can be applied and saved as `.vlp`
+JSON, but `COMPILE INTO MODEL` and `COMPILE INTO VINDEX` reject them until a
+sidecar runtime-patch policy exists.
+
 ### 7. Recompile
 
 ```sql

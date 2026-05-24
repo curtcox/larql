@@ -125,6 +125,20 @@ Benchmarked on Apple Silicon (M-series), Gemma-3 4B dimensions:
 
 At the actual Gemma-3 head dimension (256), fused is **1.6x faster** than the materialized path.
 
+## Runtime Call Patches
+
+Call patches (`op: "call"` in a `.vlp`) are runtime overlay artifacts, not
+static FFN edges. The vindex layer keeps `gate_knn` pure: a call patch adds a
+gate vector to candidate selection, and inference may inspect selected
+`(layer, feature)` hits for call metadata after candidate selection. The call
+itself must run in a hookable FFN/inference path with explicit source encoders,
+output decoders, resource limits, and residual clamps.
+
+The current implementation stores and loads call metadata, exposes it through
+`PatchedVindex::call_patch`, and rejects compile targets that cannot represent
+runtime behavior. Actual Monty execution is intentionally not part of the BLAS
+or Metal fast path yet.
+
 ### Memory
 
 | seq_len | Materialized (10 heads, f32) | Fused (hd=256, f64 acc) | Savings |

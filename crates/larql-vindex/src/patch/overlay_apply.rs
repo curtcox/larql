@@ -107,6 +107,7 @@ impl PatchedVindex {
                     down_meta,
                     ..
                 } => {
+                    self.call_patches.remove(&key);
                     if let Some(dm) = down_meta {
                         let meta = FeatureMeta {
                             top_token: dm.top_token.clone(),
@@ -119,7 +120,6 @@ impl PatchedVindex {
                             }],
                         };
                         self.overrides_meta.insert(key, Some(meta));
-                        self.call_patches.remove(&key);
                     }
                     if let Some(b64) = gate_vector_b64 {
                         if let Ok(vec) = decode_gate_vector(b64) {
@@ -204,7 +204,10 @@ impl PatchedVindex {
 mod tests {
     use super::*;
     use crate::index::VectorIndex;
-    use crate::patch::format::{encode_gate_vector, PatchDownMeta, PatchOp, VindexPatch};
+    use crate::patch::format::{
+        encode_gate_vector, CallPatchOp, PatchDownMeta, PatchOp, VindexPatch,
+    };
+    use ndarray::Array1;
 
     fn empty_pv() -> PatchedVindex {
         PatchedVindex::new(VectorIndex::new(vec![], vec![], 0, 0))
@@ -221,6 +224,25 @@ mod tests {
             tags: vec![],
             operations: ops,
         }
+    }
+
+    fn call_op(layer: usize, feature: usize, gate: &[f32]) -> PatchOp {
+        PatchOp::Call(CallPatchOp {
+            layer,
+            feature,
+            gate_vector_b64: Some(encode_gate_vector(gate)),
+            monty_code: "def main(input):\n    return input\n".into(),
+            code_hash: None,
+            input_schema: serde_json::json!({"sources": ["current_residual"]}),
+            output_schema: serde_json::json!({"sinks": ["residual_delta"]}),
+            trigger: crate::patch::format::CallTrigger {
+                score_threshold: Some(0.0),
+                ..Default::default()
+            },
+            limits: crate::patch::format::CallResourceLimits::default(),
+            safety: crate::patch::format::CallSafetyPolicy::default(),
+            metadata: serde_json::Value::Null,
+        })
     }
 
     #[test]
@@ -321,6 +343,67 @@ mod tests {
         assert_eq!(pv.overrides_gate_at(4, 9), Some(gate.as_slice()));
         assert_eq!(pv.up_override_at(4, 9), Some(up.as_slice()));
         assert_eq!(pv.down_override_at(4, 9), Some(down.as_slice()));
+    }
+
+    #[test]
+    fn apply_call_populates_gate_and_call_metadata() {
+        let mut pv = PatchedVindex::new(VectorIndex::new(vec![None], vec![None], 1, 3));
+        let gate = vec![1.0f32, 0.0, 0.0];
+        pv.apply_patch(make_patch(vec![call_op(0, 5, &gate)]));
+
+        assert_eq!(pv.overrides_gate_at(0, 5), Some(gate.as_slice()));
+        let call = pv.call_patch(0, 5).unwrap();
+        assert_eq!(call.layer, 0);
+        assert_eq!(call.feature, 5);
+        assert_eq!(pv.call_patches_for_layer(0).len(), 1);
+
+        let hits = pv.gate_knn(0, &Array1::from_vec(vec![2.0, 0.0, 0.0]), 1);
+        assert_eq!(hits, vec![(5, 2.0)]);
+    }
+
+    #[test]
+    fn delete_over_call_removes_call_metadata() {
+        let mut pv = PatchedVindex::new(VectorIndex::new(vec![None], vec![None], 1, 3));
+        pv.apply_patch(make_patch(vec![
+            call_op(0, 5, &[1.0, 0.0, 0.0]),
+            PatchOp::Delete {
+                layer: 0,
+                feature: 5,
+                reason: Some("remove runtime call".into()),
+            },
+        ]));
+
+        assert!(pv.call_patch(0, 5).is_none());
+        assert!(pv.overrides_gate_at(0, 5).is_none());
+        assert!(pv.deleted.contains(&(0, 5)));
+    }
+
+    #[test]
+    fn call_over_insert_claims_slot_as_call() {
+        let mut pv = PatchedVindex::new(VectorIndex::new(vec![None], vec![None], 1, 3));
+        pv.apply_patch(make_patch(vec![
+            PatchOp::Insert {
+                layer: 0,
+                feature: 5,
+                relation: Some("rel".into()),
+                entity: "a".into(),
+                target: "b".into(),
+                confidence: None,
+                gate_vector_b64: Some(encode_gate_vector(&[0.0, 1.0, 0.0])),
+                up_vector_b64: None,
+                down_vector_b64: None,
+                down_meta: None,
+            },
+            call_op(0, 5, &[1.0, 0.0, 0.0]),
+        ]));
+
+        assert!(pv.call_patch(0, 5).is_some());
+        let expected_gate = vec![1.0f32, 0.0, 0.0];
+        assert_eq!(pv.overrides_gate_at(0, 5), Some(expected_gate.as_slice()));
+        assert!(
+            pv.feature_meta(0, 5).is_none(),
+            "call patches should not masquerade as static feature metadata"
+        );
     }
 
     #[test]

@@ -1,0 +1,98 @@
+# Monty Call Patches
+
+Monty call patches are runtime overlay operations that attach a bounded
+function call to a vindex gate slot. They are not static knowledge edges:
+`gate_knn(layer, residual, k)` still selects candidates from gate vectors, then
+inference may inspect selected candidates for `op: "call"` metadata and run a
+sandboxed program.
+
+## Patch Shape
+
+Minimal `.vlp` operation:
+
+```json
+{
+  "op": "call",
+  "layer": 12,
+  "feature": 9001,
+  "gate_vector_b64": "<base64 encoded f32 x hidden_size>",
+  "monty_code": "def main(input):\n    return {\"residual_delta\": input[\"residual\"]}\n",
+  "code_hash": "sha256:<64 hex chars>",
+  "input_schema": {"sources": ["current_residual"]},
+  "output_schema": {"sinks": ["residual_delta"]},
+  "trigger": {
+    "score_threshold": 12.0,
+    "margin_threshold": 2.0,
+    "max_calls_per_token": 1,
+    "require_top_k": 1
+  },
+  "limits": {
+    "time_us": 250,
+    "memory_bytes": 1048576,
+    "steps": 10000
+  },
+  "safety": {
+    "residual_clamp_norm": 2.0,
+    "failure_policy": "ignore_and_continue"
+  },
+  "metadata": {"name": "normalize"}
+}
+```
+
+`code_hash` is filled at attach time when omitted. Trigger, limits, and safety
+have typed defaults. Input and output schemas remain JSON so early adapters can
+evolve without another patch-format break.
+
+## LQL Surface
+
+The implemented vertical slice supports the file-backed form:
+
+```sql
+BEGIN PATCH "tools.vlp";
+ATTACH CALL FROM FILE "normalize-call.json";
+SAVE PATCH;
+```
+
+`ATTACH CALL` requires a local vindex backend. The gate vector must decode to
+the active vindex hidden size. The operation is recorded in the current patch
+session, auto-starting an anonymous patch session like `INSERT` when needed.
+
+## Runtime Contract
+
+- Non-differentiable oracle: the function call is opaque. No gradient passes
+  through the program.
+- Next-token reach: a layer/position call can directly affect only the current
+  forward pass and therefore the current next-token distribution. Multi-token
+  effects require the generation loop to re-run calls at later positions.
+- Non-portability: call patches are runtime overlay artifacts. They are not
+  representable in vanilla safetensors or GGUF.
+- Firing safety: gate thresholding, top-k requirements, cooldowns, execution
+  budgets, residual norm clamps, and hard-negative calibration are required
+  before a call can be enabled in an inference path.
+- Dict/vector impedance: input/output encoders are explicit adapters. Residual
+  vectors are not magically serialized into useful structured objects.
+- Latency/purity: `gate_knn` remains a pure candidate selector. Function calls
+  happen only after candidate selection in a hookable FFN/inference path.
+
+## Compile Behavior
+
+`COMPILE INTO MODEL` rejects runtime call patches. `COMPILE INTO VINDEX` also
+rejects them until a deliberate `--include-runtime-patches` sidecar policy
+exists. This prevents producing artifacts that appear self-contained while
+silently dropping runtime behavior.
+
+## Current Implementation Status
+
+Implemented:
+
+- `.vlp` JSON round-trip for `op: "call"`.
+- `PatchedVindex` overlay storage and lookup by `(layer, feature)`.
+- Call gate vectors participate in ordinary patched `gate_knn`.
+- `ATTACH CALL FROM FILE`.
+- Explicit compile rejection.
+
+Not implemented yet:
+
+- Monty execution inside `larql-inference`.
+- Input/output codecs beyond persisted schema metadata.
+- Inline `ATTACH CALL ... INPUT ... OUTPUT ... TRIGGER ...` grammar.

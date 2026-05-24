@@ -561,6 +561,18 @@ SHOW PATCHES;
 ```
 
 ```
+ATTACH CALL FROM FILE <json_path>
+
+-- Attach one runtime call patch from a JSON PatchOp or VindexPatch file.
+-- The operation is recorded into the current patch session, auto-starting
+-- one if needed. The call gate vector must match the active vindex hidden
+-- size. Call patches participate in gate candidate selection, but runtime
+-- execution is handled by inference hooks rather than by gate_knn.
+
+ATTACH CALL FROM FILE "normalize-call.json";
+```
+
+```
 DIFF <vindex_a> <vindex_b>
     INTO PATCH <patch_path>
 
@@ -600,6 +612,8 @@ COMPILE {CURRENT | <vindex_path>} INTO VINDEX <output_path>
 -- through the standard dense FFN path. From this point you can also run
 -- COMPILE INTO MODEL to export to safetensors / gguf — the constellation
 -- is already in the bytes that get exported.
+-- Runtime call patches are rejected until COMPILE supports an explicit
+-- runtime sidecar policy.
 
 COMPILE CURRENT INTO VINDEX "gemma3-4b-medical.vindex";
 
@@ -616,6 +630,8 @@ COMPILE {CURRENT | <vindex_path>} INTO MODEL <output_path> [FORMAT safetensors|g
 -- weight editing is used to bake the inserted facts into W_down at the
 -- install layer(s). The output is a standard safetensors / gguf file
 -- with no vindex dependency at inference time.
+-- Runtime call patches are rejected because vanilla model weights cannot
+-- represent opaque bounded program calls.
 --
 -- Requires model weights in the vindex (EXTRACT ... WITH ALL).
 

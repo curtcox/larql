@@ -102,7 +102,7 @@ let baked = patched.bake_down();
 baked.save_vindex(&output_path, &mut config)?;
 ```
 
-In the LQL REPL, INSERT/DELETE/UPDATE automatically create a patch session. Use `SAVE PATCH "file.vlp"` to persist, or edits are discarded on exit.
+In the LQL REPL, INSERT/DELETE/UPDATE automatically create a patch session. Use `SAVE PATCH "file.vlp"` to persist, or edits are discarded on exit. Runtime call patches can be attached with `ATTACH CALL FROM FILE "call.json"`; they add a gate vector to candidate selection and store call metadata for inference, but they are not static down-vector edits.
 
 ### 1.6 Compile
 
@@ -113,6 +113,10 @@ Two compile targets:
 Produces a fresh vindex directory whose **bytes** contain the inserted
 features. No overlay file, no auto-applied sidecar — the result loads
 like any other vindex.
+
+Runtime call patches are rejected by `COMPILE INTO VINDEX` until a deliberate
+runtime sidecar policy exists. They cannot be silently flattened into
+`gate_vectors.bin` / `down_weights.bin` without losing behavior.
 
 **Algorithm:**
 1. Hard-link every read-only weight file from the source (`attn_weights.bin`,
@@ -157,6 +161,9 @@ Compiles the vindex (with patch overlay) into plain model weights. If the
 patch overlay contains INSERT operations, MEMIT closed-form weight editing
 is used to bake the inserted facts into `W_down` at the install layer(s).
 The output is a standard safetensors directory with no vindex dependency.
+
+Runtime call patches are rejected by `COMPILE INTO MODEL`; vanilla model
+weights cannot represent an opaque bounded program call.
 
 **Algorithm:**
 1. Load model weights from vindex split files

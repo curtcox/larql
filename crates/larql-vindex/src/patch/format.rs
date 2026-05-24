@@ -44,6 +44,15 @@ pub struct VindexPatch {
     pub operations: Vec<PatchOp>,
 }
 
+/// Summary counts for a patch file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PatchCounts {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+    pub calls: usize,
+}
+
 /// A single patch operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -151,13 +160,121 @@ pub struct CallPatchOp {
     #[serde(default)]
     pub output_schema: serde_json::Value,
     #[serde(default)]
-    pub trigger: serde_json::Value,
+    pub trigger: CallTrigger,
     #[serde(default)]
-    pub limits: serde_json::Value,
+    pub limits: CallResourceLimits,
     #[serde(default)]
-    pub safety: serde_json::Value,
+    pub safety: CallSafetyPolicy,
     #[serde(default)]
     pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CallTrigger {
+    #[serde(default)]
+    pub score_threshold: Option<f32>,
+    #[serde(default)]
+    pub margin_threshold: Option<f32>,
+    #[serde(default = "default_max_calls_per_token")]
+    pub max_calls_per_token: usize,
+    #[serde(default)]
+    pub max_calls_per_sequence: Option<usize>,
+    #[serde(default)]
+    pub cooldown_tokens: Option<usize>,
+    #[serde(default = "default_require_top_k")]
+    pub require_top_k: usize,
+}
+
+impl Default for CallTrigger {
+    fn default() -> Self {
+        Self {
+            score_threshold: None,
+            margin_threshold: None,
+            max_calls_per_token: default_max_calls_per_token(),
+            max_calls_per_sequence: None,
+            cooldown_tokens: None,
+            require_top_k: default_require_top_k(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallResourceLimits {
+    #[serde(default = "default_time_us")]
+    pub time_us: u64,
+    #[serde(default = "default_memory_bytes")]
+    pub memory_bytes: u64,
+    #[serde(default = "default_steps")]
+    pub steps: u64,
+}
+
+impl Default for CallResourceLimits {
+    fn default() -> Self {
+        Self {
+            time_us: default_time_us(),
+            memory_bytes: default_memory_bytes(),
+            steps: default_steps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CallSafetyPolicy {
+    #[serde(default)]
+    pub residual_clamp_norm: Option<f32>,
+    #[serde(default = "default_failure_policy")]
+    pub failure_policy: String,
+}
+
+impl Default for CallSafetyPolicy {
+    fn default() -> Self {
+        Self {
+            residual_clamp_norm: None,
+            failure_policy: default_failure_policy(),
+        }
+    }
+}
+
+impl CallPatchOp {
+    /// Fill `code_hash` with a stable SHA-256 digest when the patch JSON
+    /// omitted it. Existing hashes are preserved so externally signed or
+    /// precomputed metadata round-trips unchanged.
+    pub fn ensure_code_hash(&mut self) {
+        if self.code_hash.is_some() {
+            return;
+        }
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.monty_code.as_bytes());
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        self.code_hash = Some(format!("sha256:{hex}"));
+    }
+}
+
+fn default_max_calls_per_token() -> usize {
+    1
+}
+
+fn default_require_top_k() -> usize {
+    1
+}
+
+fn default_time_us() -> u64 {
+    250
+}
+
+fn default_memory_bytes() -> u64 {
+    1_048_576
+}
+
+fn default_steps() -> u64 {
+    10_000
+}
+
+fn default_failure_policy() -> String {
+    "ignore_and_continue".into()
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -193,18 +310,30 @@ impl VindexPatch {
 
     /// Summary counts: (inserts, updates, deletes).
     pub fn counts(&self) -> (usize, usize, usize) {
+        let counts = self.counts_detailed();
+        (counts.inserts, counts.updates, counts.deletes)
+    }
+
+    /// Summary counts including runtime call patches.
+    pub fn counts_detailed(&self) -> PatchCounts {
         let mut ins = 0;
         let mut upd = 0;
         let mut del = 0;
+        let mut calls = 0;
         for op in &self.operations {
             match op {
                 PatchOp::Insert { .. } | PatchOp::InsertKnn { .. } => ins += 1,
                 PatchOp::Update { .. } => upd += 1,
                 PatchOp::Delete { .. } | PatchOp::DeleteKnn { .. } => del += 1,
-                PatchOp::Call(_) => ins += 1,
+                PatchOp::Call(_) => calls += 1,
             }
         }
-        (ins, upd, del)
+        PatchCounts {
+            inserts: ins,
+            updates: upd,
+            deletes: del,
+            calls,
+        }
     }
 }
 
@@ -487,6 +616,33 @@ mod tests {
         assert_eq!(p.counts(), (1, 0, 1));
     }
 
+    #[test]
+    fn patch_counts_track_calls_separately() {
+        let p = make_patch(vec![PatchOp::Call(CallPatchOp {
+            layer: 0,
+            feature: 1,
+            gate_vector_b64: None,
+            monty_code: "def main(input):\n    return input\n".into(),
+            code_hash: None,
+            input_schema: serde_json::Value::Null,
+            output_schema: serde_json::Value::Null,
+            trigger: CallTrigger::default(),
+            limits: CallResourceLimits::default(),
+            safety: CallSafetyPolicy::default(),
+            metadata: serde_json::Value::Null,
+        })]);
+        assert_eq!(p.counts(), (0, 0, 0));
+        assert_eq!(
+            p.counts_detailed(),
+            PatchCounts {
+                inserts: 0,
+                updates: 0,
+                deletes: 0,
+                calls: 1,
+            }
+        );
+    }
+
     // ── Save / load round-trip ────────────────────────────────────────────
 
     #[test]
@@ -653,9 +809,15 @@ mod tests {
                 code_hash: Some("sha256:test".into()),
                 input_schema: serde_json::json!({"sources": ["current_residual"]}),
                 output_schema: serde_json::json!({"sinks": ["residual_delta"]}),
-                trigger: serde_json::json!({"score_threshold": 12.0}),
-                limits: serde_json::json!({"time_us": 250}),
-                safety: serde_json::json!({"failure_policy": "ignore"}),
+                trigger: CallTrigger {
+                    score_threshold: Some(12.0),
+                    ..Default::default()
+                },
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy {
+                    failure_policy: "ignore".into(),
+                    ..Default::default()
+                },
                 metadata: serde_json::json!({"name": "identity"}),
             })],
         };
@@ -670,9 +832,34 @@ mod tests {
                     decode_gate_vector(call.gate_vector_b64.as_ref().unwrap()).unwrap(),
                     gate
                 );
-                assert_eq!(call.trigger["score_threshold"], 12.0);
+                assert_eq!(call.trigger.score_threshold, Some(12.0));
+                assert_eq!(call.limits.time_us, 250);
             }
             _ => panic!("expected Call"),
         }
+    }
+
+    #[test]
+    fn call_patch_ensure_code_hash_is_stable() {
+        let mut call = CallPatchOp {
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            monty_code: "def main(input):\n    return input\n".into(),
+            code_hash: None,
+            input_schema: serde_json::Value::Null,
+            output_schema: serde_json::Value::Null,
+            trigger: CallTrigger::default(),
+            limits: CallResourceLimits::default(),
+            safety: CallSafetyPolicy::default(),
+            metadata: serde_json::Value::Null,
+        };
+
+        call.ensure_code_hash();
+        let first = call.code_hash.clone().unwrap();
+        call.ensure_code_hash();
+        assert_eq!(call.code_hash.as_deref(), Some(first.as_str()));
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(first.len(), "sha256:".len() + 64);
     }
 }

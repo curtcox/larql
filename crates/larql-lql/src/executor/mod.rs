@@ -399,7 +399,7 @@ impl Session {
             operations: recording.operations,
         };
 
-        let (ins, upd, del) = patch.counts();
+        let counts = patch.counts_detailed();
         let path = PathBuf::from(&recording.path);
         patch
             .save(&path)
@@ -408,11 +408,12 @@ impl Session {
         self.auto_patch = false;
 
         Ok(vec![format!(
-            "Saved: {} ({} inserts, {} updates, {} deletes)",
+            "Saved: {} ({} inserts, {} updates, {} deletes, {} calls)",
             path.display(),
-            ins,
-            upd,
-            del,
+            counts.inserts,
+            counts.updates,
+            counts.deletes,
+            counts.calls,
         )])
     }
 
@@ -425,7 +426,7 @@ impl Session {
         let patch = larql_vindex::VindexPatch::load(&patch_path)
             .map_err(|e| LqlError::exec("failed to load patch", e))?;
 
-        let (ins, upd, del) = patch.counts();
+        let counts = patch.counts_detailed();
         let total = patch.len();
 
         // Apply through the PatchedVindex overlay (base files untouched)
@@ -437,7 +438,8 @@ impl Session {
         }
 
         Ok(vec![format!(
-            "Applied: {path} ({total} operations: {ins} inserts, {upd} updates, {del} deletes)"
+            "Applied: {path} ({total} operations: {} inserts, {} updates, {} deletes, {} calls)",
+            counts.inserts, counts.updates, counts.deletes, counts.calls
         )])
     }
 
@@ -449,16 +451,17 @@ impl Session {
             out.push("  (no patches applied)".into());
         } else {
             for (i, patch) in patched.patches.iter().enumerate() {
-                let (ins, upd, del) = patch.counts();
+                let counts = patch.counts_detailed();
                 let name = patch.description.as_deref().unwrap_or("(unnamed)");
                 out.push(format!(
-                    "  {}. {:<40} {} ops ({} ins, {} upd, {} del)",
+                    "  {}. {:<40} {} ops ({} ins, {} upd, {} del, {} call)",
                     i + 1,
                     name,
                     patch.len(),
-                    ins,
-                    upd,
-                    del,
+                    counts.inserts,
+                    counts.updates,
+                    counts.deletes,
+                    counts.calls,
                 ));
             }
             if patched.num_overrides() > 0 && patched.patches.is_empty() {
@@ -515,9 +518,12 @@ impl Session {
     fn exec_attach_call(&mut self, path: &str) -> Result<Vec<String>, LqlError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| LqlError::Execution(format!("failed to read call patch {path}: {e}")))?;
-        let op = parse_call_patch_op(&text)?;
-        let call = match &op {
-            larql_vindex::PatchOp::Call(call) => call.clone(),
+        let mut op = parse_call_patch_op(&text)?;
+        let call = match &mut op {
+            larql_vindex::PatchOp::Call(call) => {
+                call.ensure_code_hash();
+                call.clone()
+            }
             _ => {
                 return Err(LqlError::Execution(
                     "ATTACH CALL FROM FILE expects a JSON PatchOp with op=\"call\"".into(),
@@ -534,7 +540,17 @@ impl Session {
             })?;
 
         match &mut self.backend {
-            Backend::Vindex { patched, .. } => patched.insert_call_patch(call.clone(), gate_vec),
+            Backend::Vindex { patched, .. } => {
+                let hidden = patched.hidden_size();
+                if hidden > 0 && gate_vec.len() != hidden {
+                    return Err(LqlError::Execution(format!(
+                        "call gate vector has dim {}, expected hidden size {}",
+                        gate_vec.len(),
+                        hidden
+                    )));
+                }
+                patched.insert_call_patch(call.clone(), gate_vec);
+            }
             _ => return Err(LqlError::NoBackend),
         }
 
