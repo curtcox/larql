@@ -14,8 +14,9 @@ This document is now split into two readings:
   via the `apply_call_patches_dense` post-processing step), Metal/GPU walk path
   wiring (interleaved Q4 Metal/CPU, sparse full-K gemv, parallel Q4K down, and
   optional backend on public predict/generate helpers).
-* **Remaining**: batched prefill beyond the KV-cached CPU generation loop,
-  production safety hardening, benchmarks, and the training pipeline.
+* **Remaining**: fused GPU `prefill_kquant` with call patches, cross-layer KV
+  sharing on the generation path, production safety hardening, benchmarks, and
+  the training pipeline.
 
 Already implemented in-tree
 
@@ -73,7 +74,8 @@ Already implemented in-tree
 Still remaining
 
 * Extend execution beyond single-stream KV-cached generation:
-    * batched prefill beyond the KV-cached generation loop
+    * fused GPU `prefill_kquant` with call patches (CPU Q4K batched prefill path is wired)
+    * cross-layer KV sharing on the call-patch generation path
 * Expand inline LQL beyond the current file-backed/gate-code vertical slice if
   richer `INPUT (...)`, `OUTPUT (...)`, and policy grammar proves necessary.
 * Build the codec roadmap beyond the current raw residual / top-k basis /
@@ -97,8 +99,8 @@ Multi-token generation with call patches is now implemented via
 state once at the start, and return `GenerateResultWithCallMetrics` with
 aggregate `call_metrics` and optional per-event `trace_events`.
 
-The next highest-leverage step is batched prefill integration beyond the
-KV-cached single-stream CPU generation loop.
+The next highest-leverage step is fused GPU `prefill_kquant` with call patches
+and cross-layer KV sharing on the generation path.
 
 Reading note
 
@@ -236,14 +238,22 @@ KV-cached CPU generation — complete:
   contexts so cooldown and per-sequence budgets work across decode steps.
 * Dense and sparse `WalkFfn` paths both fire call patches on prefill and decode.
 
+KV-cached Q4K batched prefill with call patches — complete:
+
+* `supports_kquant_cached_custom_ffn` gates the Q4K cached driver for call patches.
+* `predict_kquant_prefill_with_call_patches` / `predict_kquant_decode_step_with_call_patches`
+  build per-layer `WalkFfn` inside the layer loop (avoids `weights` borrow conflicts).
+* `generate_with_call_patches_runner` routes through the Q4K cached path when eligible,
+  otherwise falls back to the generic KV layer loop.
+* `prefill_with_kv_ffn` and `PipelinedLayerGraph::ffn` support batched multi-token
+  prefill with a caller-supplied FFN backend.
+
 Still incomplete:
 
-* Batched prefill integration beyond the KV-cached single-stream loop.
+* Fused GPU `prefill_kquant` kernel path with call patches.
 * Cross-layer KV sharing on the call-patch generation path (same constraint as
   `supports_cached_decode` — architectures with `kv_shared_source_layer` need
   a dedicated path).
-* `PipelinedLayerGraph` / multi-layer GPU batch FFN does not yet thread call
-  patches (single-layer `WalkFfn` paths are covered).
 
 ⸻
 

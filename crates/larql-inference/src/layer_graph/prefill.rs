@@ -2,6 +2,7 @@
 
 use ndarray::Array2;
 
+use crate::ffn::FfnBackend;
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 
@@ -14,6 +15,26 @@ pub fn prefill_with_kv(
     index: &larql_vindex::VectorIndex,
     backend: &dyn ComputeBackend,
     layer_range: std::ops::Range<usize>,
+) -> Array2<f32> {
+    prefill_with_kv_ffn(
+        weights,
+        token_ids,
+        index,
+        backend,
+        layer_range,
+        &crate::vindex::WalkFfn::new_unlimited(weights, index),
+    )
+}
+
+/// Batched multi-token prefill with a caller-supplied FFN backend (e.g. call-patch
+/// [`crate::vindex::WalkFfn`]). Populates the backend KV cache when supported.
+pub fn prefill_with_kv_ffn(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+    _index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    layer_range: std::ops::Range<usize>,
+    ffn: &dyn FfnBackend,
 ) -> Array2<f32> {
     let mut h = crate::forward::embed_tokens_pub(weights, token_ids);
     let seq_len = token_ids.len();
@@ -31,8 +52,7 @@ pub fn prefill_with_kv(
             backend.populate_kv_layer(layer, k_flat, v_flat, seq_len, layer_nkv, layer_hd);
         }
 
-        let walk_ffn = crate::vindex::WalkFfn::new_unlimited(weights, index);
-        let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+        let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, ffn, false);
         h = h_out;
     }
     h

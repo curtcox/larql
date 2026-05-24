@@ -40,6 +40,10 @@ use crate::attention::{
 };
 use crate::ffn::WeightFfn;
 use crate::forward::embed_tokens_pub;
+use crate::monty_call::WalkCallRuntime;
+use crate::vindex::walk_config::WalkFfnConfig;
+use crate::vindex::WalkFfn;
+use larql_vindex::PatchedVindex;
 use crate::forward::layer::apply_layer_scalar;
 use crate::forward::ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
 use crate::forward::run_ffn;
@@ -84,6 +88,16 @@ pub fn supports_cached_decode(weights: &ModelWeights) -> bool {
     true
 }
 
+/// True when the KV-cached Q4K driver can run with a custom [`FfnBackend`]
+/// (e.g. [`crate::vindex::WalkFfn`] with call patches). Requires dense
+/// cached-decode eligibility plus Q4K tensor materialization on the index.
+pub fn supports_kquant_cached_custom_ffn(weights: &ModelWeights, index: &VectorIndex) -> bool {
+    supports_cached_decode(weights)
+        && index
+            .attn_kquant_layer_data(0)
+            .is_some()
+}
+
 /// Prefill: run the full prompt through every layer once, capturing
 /// each layer's post-RoPE K and final V into the returned cache.
 /// Returns the `[seq_len, hidden]` hidden state and the populated
@@ -94,6 +108,26 @@ pub fn predict_kquant_prefill(
     index: &VectorIndex,
 ) -> (Array2<f32>, CpuKvCache, CachedTimings) {
     predict_kquant_prefill_with_state(weights, token_ids, index, None)
+}
+
+/// Call-patch context for the KV-cached Q4K prefill/decode driver.
+pub struct KquantCallPatchCtx<'a, R: crate::monty_call::CallProgramRunner> {
+    pub tensor_index: &'a VectorIndex,
+    pub patched: &'a PatchedVindex,
+    pub config: WalkFfnConfig,
+    pub runtime: &'a std::cell::RefCell<crate::monty_call::MontyCallRuntime<R>>,
+    pub call_position_base: usize,
+    pub matmul_backend: Option<&'a dyn ComputeBackend>,
+}
+
+/// KV-cached Q4K prefill with call-patch [`WalkFfn`]. Builds the walk FFN inside
+/// each layer so `weights` can stay mutably borrowed for Q4K tensor insert.
+pub fn predict_kquant_prefill_with_call_patches<R: crate::monty_call::CallProgramRunner>(
+    weights: &mut ModelWeights,
+    token_ids: &[u32],
+    ctx: &KquantCallPatchCtx<'_, R>,
+) -> (Array2<f32>, CpuKvCache, CachedTimings) {
+    predict_kquant_prefill_with_call_patches_and_state(weights, token_ids, ctx, None)
 }
 
 /// Prefill with optional per-layer state capture (W1-GPU step 3
@@ -123,7 +157,6 @@ pub fn predict_kquant_prefill_with_state(
             insert_q4k_layer_tensors(weights, index, layer).unwrap_or_else(|err| panic!("{err}"));
         timings.dequant_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
-        // Snapshot pre-attention residual for this layer if engine wants it.
         if let Some(s) = state.as_deref_mut() {
             s.h_in_per_layer
                 .push(larql_compute::state_handle::CpuStateHandle::boxed(
@@ -131,9 +164,6 @@ pub fn predict_kquant_prefill_with_state(
                 ));
         }
 
-        // Attention with K/V capture. Backend stays None — we want the
-        // CPU BLAS path for the dequantised f32 tensors that
-        // `insert_q4k_layer_tensors` just placed in `weights.tensors`.
         let (h_post_attn, k_rope, v_final) =
             match run_attention_with_kv_backend(weights, &h, layer, None) {
                 Some(t) => t,
@@ -144,7 +174,6 @@ pub fn predict_kquant_prefill_with_state(
             };
 
         if let Some(s) = state.as_deref_mut() {
-            // Prefill K/V for THIS layer = full seq_len × kv_dim.
             s.k_new_per_layer
                 .push(larql_compute::state_handle::CpuStateHandle::boxed(
                     k_rope.clone(),
@@ -157,6 +186,76 @@ pub fn predict_kquant_prefill_with_state(
 
         let ffn = WeightFfn { weights };
         let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &ffn, false);
+        let mut h_out =
+            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
+        apply_layer_scalar(weights, &mut h_out, layer);
+
+        remove_layer_tensors(weights, inserted);
+
+        cache[layer] = Some((k_rope, v_final));
+        h = h_out;
+    }
+
+    (h, cache, timings)
+}
+
+/// Prefill with optional per-layer state capture and call-patch walk FFN.
+pub fn predict_kquant_prefill_with_call_patches_and_state<
+    R: crate::monty_call::CallProgramRunner,
+>(
+    weights: &mut ModelWeights,
+    token_ids: &[u32],
+    ctx: &KquantCallPatchCtx<'_, R>,
+    mut state: Option<&mut crate::PerLayerDecodeState>,
+) -> (Array2<f32>, CpuKvCache, CachedTimings) {
+    let num_layers = weights.num_layers;
+    let mut cache: CpuKvCache = vec![None; num_layers];
+    let mut timings = CachedTimings::default();
+
+    let mut h = embed_tokens_pub(weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
+
+    for layer in 0..num_layers {
+        let t0 = std::time::Instant::now();
+        let inserted = insert_q4k_layer_tensors(weights, ctx.tensor_index, layer)
+            .unwrap_or_else(|err| panic!("{err}"));
+        timings.dequant_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+        if let Some(s) = state.as_deref_mut() {
+            s.h_in_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    h.clone(),
+                ));
+        }
+
+        let (h_post_attn, k_rope, v_final) =
+            match run_attention_with_kv_backend(weights, &h, layer, None) {
+                Some(t) => t,
+                None => {
+                    remove_layer_tensors(weights, inserted);
+                    return (h, cache, timings);
+                }
+            };
+
+        if let Some(s) = state.as_deref_mut() {
+            s.k_new_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    k_rope.clone(),
+                ));
+            s.v_new_per_layer
+                .push(larql_compute::state_handle::CpuStateHandle::boxed(
+                    v_final.clone(),
+                ));
+        }
+
+        let mut walk_ffn = WalkFfn::from_config(weights, ctx.patched, ctx.config.clone())
+            .with_call_patches(ctx.patched)
+            .with_call_runtime(ctx.runtime as &dyn WalkCallRuntime);
+        if let Some(be) = ctx.matmul_backend {
+            walk_ffn = walk_ffn.with_backend(be);
+        }
+        walk_ffn.set_call_position_base(ctx.call_position_base);
+        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
         let mut h_out =
             apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
         apply_layer_scalar(weights, &mut h_out, layer);
@@ -190,7 +289,6 @@ pub fn predict_kquant_decode_step(
     }
     let mut timings = CachedTimings::default();
 
-    // 1-row embed + 1-row PLE for the new token.
     let mut h = embed_tokens_pub(weights, &[token_id]);
     let ple_inputs = precompute_per_layer_inputs(weights, &h, &[token_id]);
 
@@ -219,6 +317,66 @@ pub fn predict_kquant_decode_step(
 
         let ffn = WeightFfn { weights };
         let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &ffn, false);
+        let mut h_out =
+            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
+        apply_layer_scalar(weights, &mut h_out, layer);
+
+        remove_layer_tensors(weights, inserted);
+
+        h = h_out;
+    }
+
+    Some((h, timings))
+}
+
+/// Single-token KV decode with call-patch [`WalkFfn`].
+pub fn predict_kquant_decode_step_with_call_patches<R: crate::monty_call::CallProgramRunner>(
+    weights: &mut ModelWeights,
+    token_id: u32,
+    cache: &mut CpuKvCache,
+    abs_position: usize,
+    ctx: &KquantCallPatchCtx<'_, R>,
+) -> Option<(Array2<f32>, CachedTimings)> {
+    let num_layers = weights.num_layers;
+    if cache.len() != num_layers {
+        return None;
+    }
+    let mut timings = CachedTimings::default();
+
+    let mut h = embed_tokens_pub(weights, &[token_id]);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, &[token_id]);
+
+    for layer in 0..num_layers {
+        let t0 = std::time::Instant::now();
+        let inserted = insert_q4k_layer_tensors(weights, ctx.tensor_index, layer)
+            .unwrap_or_else(|err| panic!("{err}"));
+        timings.dequant_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+        let kv_entry = cache[layer].as_ref();
+        let (h_post_attn, new_kv) = match run_attention_block_decode_step_backend(
+            weights,
+            &h,
+            layer,
+            kv_entry,
+            abs_position,
+            ctx.matmul_backend,
+        ) {
+            Some(t) => t,
+            None => {
+                remove_layer_tensors(weights, inserted);
+                return None;
+            }
+        };
+        cache[layer] = Some(new_kv);
+
+        let mut walk_ffn = WalkFfn::from_config(weights, ctx.patched, ctx.config.clone())
+            .with_call_patches(ctx.patched)
+            .with_call_runtime(ctx.runtime as &dyn WalkCallRuntime);
+        if let Some(be) = ctx.matmul_backend {
+            walk_ffn = walk_ffn.with_backend(be);
+        }
+        walk_ffn.set_call_position_base(ctx.call_position_base);
+        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
         let mut h_out =
             apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
         apply_layer_scalar(weights, &mut h_out, layer);

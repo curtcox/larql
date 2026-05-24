@@ -53,6 +53,8 @@ pub struct PipelinedLayerGraph<'a> {
     pub index: &'a dyn larql_vindex::GateIndex,
     pub backend: &'a dyn ComputeBackend,
     pub layer_range: std::ops::Range<usize>,
+    /// When set, used for FFN instead of a fresh unlimited `WalkFfn` (call patches, etc.).
+    pub ffn: Option<&'a dyn FfnBackend>,
 }
 
 impl<'a> LayerGraph for PipelinedLayerGraph<'a> {
@@ -70,13 +72,13 @@ impl<'a> LayerGraph for PipelinedLayerGraph<'a> {
         let (h_post_attn, _attn_proj, _) =
             crate::attention::run_attention_block_gpu(weights, h, layer, false, None)?;
 
-        // FFN: use WalkFfn which handles Q4 dispatch internally.
-        // WalkFfn checks for Q4 interleaved data and routes to Metal Q4
-        // when backend.supports_quant(::larql_compute::QuantFormat::Q4_K), falling back to f32 BLAS otherwise.
-        // This ensures the norm/residual logic matches exactly.
-        let walk_ffn =
-            crate::vindex::WalkFfn::new_unlimited_with_backend(weights, self.index, self.backend);
-        let (h_out, _) = crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+        let (h_out, _) = if let Some(ffn) = self.ffn {
+            crate::forward::run_ffn(weights, &h_post_attn, layer, ffn, false)
+        } else {
+            let walk_ffn =
+                crate::vindex::WalkFfn::new_unlimited_with_backend(weights, self.index, self.backend);
+            crate::forward::run_ffn(weights, &h_post_attn, layer, &walk_ffn, false)
+        };
         Some(LayerOutput {
             residual: h_out,
             activation: None,
@@ -173,6 +175,7 @@ mod tests {
             index: &idx,
             backend: &larql_compute::CpuBackend,
             layer_range: 0..w.num_layers,
+            ffn: None,
         };
         assert_eq!(g.name(), "pipelined");
     }
@@ -185,6 +188,7 @@ mod tests {
             index: &idx,
             backend: &larql_compute::CpuBackend,
             layer_range: 5..10, // range that excludes layer 0
+            ffn: None,
         };
         let h = input(1, w.hidden_size);
         // Layer 0 is outside range 5..10 → None
@@ -200,6 +204,7 @@ mod tests {
             index: &idx,
             backend: &larql_compute::CpuBackend,
             layer_range: 0..w.num_layers,
+            ffn: None,
         };
         let h = input(1, w.hidden_size);
         let out = g.forward_layer(w, &h, 0);

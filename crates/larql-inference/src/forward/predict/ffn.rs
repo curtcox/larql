@@ -185,7 +185,7 @@ impl GenerateResultWithCallMetrics {
 /// Convenience wrapper over [`generate_with_call_patches_runner`] using the
 /// default [`MontyVmRunner`] and no trace collection.
 pub fn generate_with_call_patches(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
     token_ids: &[u32],
     max_tokens: usize,
@@ -215,14 +215,17 @@ pub fn generate_with_call_patches(
 /// accumulates call-patch metrics and optional trace events across the full
 /// sequence.
 ///
-/// Uses the production KV-cached CPU loop (prefill once, then single-token
-/// decode steps) so call patches fire on both sparse and dense `WalkFfn`
-/// paths without re-running the full prompt each token.
+/// Uses a production KV-cached loop (prefill once, then single-token decode
+/// steps). When the model and vindex support Q4K cached decode
+/// ([`crate::vindex::supports_kquant_cached_custom_ffn`]), prefill and decode
+/// run through that driver with [`WalkFfn`] so batched prompt positions and
+/// decode steps both fire call patches. Otherwise falls back to the generic
+/// layer loop in [`kv_prefill_with_call_ffn`].
 ///
 /// Pass `backend` to enable Metal/GPU matmul paths; call patches execute on
 /// CPU after the accelerated FFN completes.
 pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
     token_ids: &[u32],
     max_tokens: usize,
@@ -263,6 +266,76 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
     let runtime = RefCell::new(base_runtime);
     runtime.borrow_mut().reset_sequence_state();
 
+    let use_kquant_cached =
+        crate::vindex::supports_kquant_cached_custom_ffn(weights, patched.base());
+
+    let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
+    let mut decode_ms: Vec<f64> = Vec::with_capacity(max_tokens);
+
+    if use_kquant_cached {
+        let tensor_index = patched.base();
+        let prefill_start = std::time::Instant::now();
+        let kquant_ctx = crate::vindex::KquantCallPatchCtx {
+            tensor_index,
+            patched,
+            config: config.clone(),
+            runtime: &runtime,
+            call_position_base: 0,
+            matmul_backend: backend,
+        };
+        let (h_prompt, q4_cache) = {
+            let (h_prompt, q4_cache, _) = crate::vindex::predict_kquant_prefill_with_call_patches(
+                weights,
+                token_ids,
+                &kquant_ctx,
+            );
+            (h_prompt, q4_cache)
+        };
+        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+        let decode_state = KquantCallDecodeState { cache: q4_cache };
+        match sample_first_and_decode_loop_kquant(
+            weights,
+            tokenizer,
+            patched,
+            config,
+            &runtime,
+            backend,
+            eos,
+            max_tokens,
+            &last_row_as_2d(&h_prompt),
+            token_ids.len(),
+            decode_state,
+            &mut tokens,
+            &mut decode_ms,
+            &kquant_ctx,
+        ) {
+            Ok(()) => {
+                let call_metrics = runtime.borrow().metrics();
+                let trace_events = runtime.borrow_mut().take_trace_events();
+                return GenerateResultWithCallMetrics {
+                    tokens,
+                    prefill_ms,
+                    decode_ms,
+                    call_metrics,
+                    trace_events,
+                    error: None,
+                };
+            }
+            Err(err) => {
+                let call_metrics = runtime.borrow().metrics();
+                let trace_events = runtime.borrow_mut().take_trace_events();
+                return GenerateResultWithCallMetrics {
+                    tokens,
+                    prefill_ms,
+                    decode_ms,
+                    call_metrics,
+                    trace_events,
+                    error: Some(err),
+                };
+            }
+        }
+    }
+
     let mut ffn = WalkFfn::from_config(weights, patched, config)
         .with_call_patches(patched)
         .with_call_runtime(&runtime);
@@ -270,30 +343,134 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
         ffn = ffn.with_backend(be);
     }
 
-    let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
-    let mut decode_ms: Vec<f64> = Vec::with_capacity(max_tokens);
-
     let prefill_start = std::time::Instant::now();
-    let (last_hidden, mut kv_cache, mut next_position) =
-        match kv_prefill_with_call_ffn(weights, token_ids, &ffn) {
-            Some(t) => t,
-            None => {
-                let call_metrics = runtime.borrow().metrics();
-                let trace_events = runtime.borrow_mut().take_trace_events();
-                return GenerateResultWithCallMetrics {
-                    tokens,
-                    prefill_ms: 0.0,
-                    decode_ms,
-                    call_metrics,
-                    trace_events,
-                    error: Some(GenerateError::empty_output(
-                        "generate_with_call_patches: prefill failed",
-                    )),
-                };
+    match kv_prefill_with_call_ffn(weights, token_ids, &ffn) {
+        Some((last_hidden, mut kv_cache, next_position)) => {
+            let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+            finish_generate_with_call_legacy(
+                weights,
+                tokenizer,
+                &ffn,
+                eos,
+                max_tokens,
+                prefill_ms,
+                last_hidden,
+                &mut kv_cache,
+                next_position,
+                &runtime,
+                &mut tokens,
+                &mut decode_ms,
+            )
+        }
+        None => {
+            let call_metrics = runtime.borrow().metrics();
+            let trace_events = runtime.borrow_mut().take_trace_events();
+            GenerateResultWithCallMetrics {
+                tokens,
+                prefill_ms: 0.0,
+                decode_ms,
+                call_metrics,
+                trace_events,
+                error: Some(GenerateError::empty_output(
+                    "generate_with_call_patches: prefill failed",
+                )),
             }
-        };
-    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+}
 
+struct KquantCallDecodeState {
+    cache: crate::vindex::CpuKvCache,
+}
+
+/// After Q4K cached prefill: sample first token and run decode loop.
+fn sample_first_and_decode_loop_kquant<R: CallProgramRunner>(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    _patched: &larql_vindex::PatchedVindex,
+    config: WalkFfnConfig,
+    _runtime: &RefCell<MontyCallRuntime<R>>,
+    _backend: Option<&dyn larql_compute::ComputeBackend>,
+    eos: &EosConfig,
+    max_tokens: usize,
+    first_hidden: &Array2<f32>,
+    mut next_position: usize,
+    mut decode_state: KquantCallDecodeState,
+    tokens: &mut Vec<(String, f64)>,
+    decode_ms: &mut Vec<f64>,
+    kquant_ctx_template: &crate::vindex::KquantCallPatchCtx<'_, R>,
+) -> Result<(), GenerateError> {
+    let first = logits_to_predictions(weights, first_hidden, tokenizer, 1, 1.0);
+    let first_stop = match (first.token_ids.first(), first.predictions.first()) {
+        (Some(&id), Some(pred)) => {
+            let stop = eos.is_eos_with_tokenizer(id, &pred.0, tokenizer);
+            tokens.push((pred.0.clone(), 1.0));
+            stop
+        }
+        _ => {
+            return Err(GenerateError::empty_output(
+                "generate_with_call_patches: no first token",
+            ));
+        }
+    };
+    if first_stop || max_tokens == 1 {
+        return Ok(());
+    }
+
+    let mut current_id = first.token_ids[0];
+    for _step in 1..max_tokens {
+        let step_start = std::time::Instant::now();
+        let step_ctx = crate::vindex::KquantCallPatchCtx {
+            tensor_index: kquant_ctx_template.tensor_index,
+            patched: kquant_ctx_template.patched,
+            config: config.clone(),
+            runtime: kquant_ctx_template.runtime,
+            call_position_base: next_position,
+            matmul_backend: kquant_ctx_template.matmul_backend,
+        };
+        let h_step = match crate::vindex::predict_kquant_decode_step_with_call_patches(
+            weights,
+            current_id,
+            &mut decode_state.cache,
+            next_position,
+            &step_ctx,
+        ) {
+            Some((h, _timings)) => h,
+            None => break,
+        };
+        next_position += 1;
+        decode_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
+
+        let result = logits_to_predictions(weights, &h_step, tokenizer, 1, 1.0);
+        match (result.token_ids.first(), result.predictions.first()) {
+            (Some(&id), Some(pred)) => {
+                let stop = eos.is_eos_with_tokenizer(id, &pred.0, tokenizer);
+                tokens.push((pred.0.clone(), 1.0));
+                current_id = id;
+                if stop {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+fn finish_generate_with_call_legacy<R: CallProgramRunner>(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    ffn: &WalkFfn<'_>,
+    eos: &EosConfig,
+    max_tokens: usize,
+    prefill_ms: f64,
+    last_hidden: Array2<f32>,
+    kv_cache: &mut HashMap<usize, SharedKV>,
+    mut next_position: usize,
+    runtime: &RefCell<MontyCallRuntime<R>>,
+    tokens: &mut Vec<(String, f64)>,
+    decode_ms: &mut Vec<f64>,
+) -> GenerateResultWithCallMetrics {
     let first = logits_to_predictions(weights, &last_hidden, tokenizer, 1, 1.0);
     let first_stop = match (first.token_ids.first(), first.predictions.first()) {
         (Some(&id), Some(pred)) => {
@@ -305,9 +482,9 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
             let call_metrics = runtime.borrow().metrics();
             let trace_events = runtime.borrow_mut().take_trace_events();
             return GenerateResultWithCallMetrics {
-                tokens,
+                tokens: tokens.clone(),
                 prefill_ms,
-                decode_ms,
+                decode_ms: decode_ms.clone(),
                 call_metrics,
                 trace_events,
                 error: Some(GenerateError::empty_output(
@@ -320,9 +497,9 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
         let call_metrics = runtime.borrow().metrics();
         let trace_events = runtime.borrow_mut().take_trace_events();
         return GenerateResultWithCallMetrics {
-            tokens,
+            tokens: tokens.clone(),
             prefill_ms,
-            decode_ms,
+            decode_ms: decode_ms.clone(),
             call_metrics,
             trace_events,
             error: None,
@@ -335,8 +512,8 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
         ffn.set_call_position_base(next_position);
         let h_step = match kv_decode_step_with_call_ffn(
             weights,
-            &ffn,
-            &mut kv_cache,
+            ffn,
+            kv_cache,
             current_id,
             next_position,
         ) {
@@ -344,8 +521,7 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
             None => break,
         };
         next_position += 1;
-        let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-        decode_ms.push(step_ms);
+        decode_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
 
         let result = logits_to_predictions(weights, &h_step, tokenizer, 1, 1.0);
         match (result.token_ids.first(), result.predictions.first()) {
@@ -364,9 +540,9 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
     let call_metrics = runtime.borrow().metrics();
     let trace_events = runtime.borrow_mut().take_trace_events();
     GenerateResultWithCallMetrics {
-        tokens,
+        tokens: tokens.clone(),
         prefill_ms,
-        decode_ms,
+        decode_ms: decode_ms.clone(),
         call_metrics,
         trace_events,
         error: None,
@@ -720,13 +896,14 @@ mod tests {
             },
             first_hidden.iter().map(|v| v * 100.0).collect(),
         );
+        let num_layers = fx.weights.num_layers;
         let result = generate_with_call_patches_runner(
-            &fx.weights,
+            &mut fx.weights,
             &fx.tokenizer,
             &[0u32],
             3,
             &patched,
-            WalkFfnConfig::sparse(fx.weights.num_layers, 1),
+            WalkFfnConfig::sparse(num_layers, 1),
             StaticRunner { hidden },
             PredictCallPatchesOptions::default(),
             None,
@@ -750,13 +927,14 @@ mod tests {
         attach_feature_major_f32_to_test_vindex(&fx.weights, &mut fx.index);
         let hidden = fx.weights.hidden_size;
         let patched = larql_vindex::PatchedVindex::new(fx.index);
+        let num_layers = fx.weights.num_layers;
         let result = generate_with_call_patches_runner(
-            &fx.weights,
+            &mut fx.weights,
             &fx.tokenizer,
             &[0u32],
             0,
             &patched,
-            WalkFfnConfig::sparse(fx.weights.num_layers, 1),
+            WalkFfnConfig::sparse(num_layers, 1),
             StaticRunner { hidden },
             PredictCallPatchesOptions::default(),
             None,
@@ -794,13 +972,14 @@ mod tests {
             },
             first_hidden.iter().map(|v| v * 100.0).collect(),
         );
+        let num_layers = fx.weights.num_layers;
         let result = generate_with_call_patches_runner(
-            &fx.weights,
+            &mut fx.weights,
             &fx.tokenizer,
             &[0u32],
             2,
             &patched,
-            WalkFfnConfig::sparse(fx.weights.num_layers, 1),
+            WalkFfnConfig::sparse(num_layers, 1),
             StaticRunner { hidden },
             PredictCallPatchesOptions::default().with_trace(),
             None,

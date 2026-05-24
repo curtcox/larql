@@ -201,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         index: &index,
         backend: &*gpu_be,
         layer_range: 13..num_layers,
+        ffn: None,
     };
     let pipelined_graph = build_adaptive_graph(&cache, &pipelined, num_layers, &(0..=12));
     let _ = predict_pipeline(

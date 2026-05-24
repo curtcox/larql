@@ -110,5 +110,6 @@ Implemented:
 
 Not implemented yet:
 
-- Batched multi-layer GPU prefill with call patches.
+- Fused GPU `prefill_kquant` with call patches (CPU Q4K KV-cached batched prefill is wired).
+- Cross-layer KV sharing on the call-patch generation path.
 - Inline `ATTACH CALL ... INPUT ... OUTPUT ... TRIGGER ...` grammar.

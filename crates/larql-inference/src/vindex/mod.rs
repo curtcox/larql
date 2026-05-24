@@ -31,8 +31,11 @@ pub use kquant_forward::{
     predict_kquant_hidden_with_zeroed_pre_o_heads, predict_kquant_metal,
     predict_kquant_metal_capture_pre_wo, predict_kquant_metal_hidden,
     predict_kquant_metal_with_replaced_head_residual_delta, predict_kquant_prefill,
-    predict_kquant_prefill_with_state, predict_kquant_with_ffn, remove_layer_tensors,
-    supports_cached_decode, supports_direct_matvec_decode, CachedTimings, CpuKvCache,
+    predict_kquant_prefill_with_call_patches, predict_kquant_prefill_with_state,
+    predict_kquant_decode_step_with_call_patches, predict_kquant_with_ffn, remove_layer_tensors,
+    KquantCallPatchCtx,
+    supports_cached_decode, supports_direct_matvec_decode, supports_kquant_cached_custom_ffn,
+    CachedTimings, CpuKvCache,
 };
 pub use l1_cache::FfnL1Cache;
 pub use loader::{open_inference_vindex, ENV_VINDEX_PATH};
