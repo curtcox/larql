@@ -65,6 +65,7 @@ pub mod layer_graph;
 pub mod model;
 pub mod monty_call;
 pub mod prompt;
+pub mod training;
 pub mod residual;
 pub mod residual_diff;
 pub mod test_utils;
