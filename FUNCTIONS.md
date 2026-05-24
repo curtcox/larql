@@ -16,9 +16,14 @@ This document is now split into two readings:
   optional backend on public predict/generate helpers), fused GPU prefill +
   decode with call patches (`fused_prefill_with_call_patches` /
   `fused_decode_step_with_call_patches`; `generate_with_call_patches_runner`
-  routes end-to-end on Metal when eligible).
-* **Remaining**: production safety hardening, benchmarks, and the training
-  pipeline.
+  routes end-to-end on Metal when eligible), M6 learned linear codec, M7
+  compile/artifact strict modes, M8 training prototype (synthetic tasks, gate
+  calibration, decoder warmup, surrogate backward, evaluation harness), and M9
+  research-grade training (Toolformer mining, joint g/E/D/LoRA fine-tune,
+  ablation framework, surrogate-vs-REINFORCE comparison).
+* **Remaining**: optional inline LQL grammar expansion and additional codec
+  variants if production use cases require them. All core milestones M1–M9
+  are complete.
 
 Already implemented in-tree
 
@@ -85,24 +90,34 @@ Still remaining
   learned linear artifact format; training-time codec learning remains M8+).
 * ~~M7: `COMPILE INTO MODEL` hard rejection; `COMPILE INTO VINDEX` strict /
   runtime-sidecar modes; docs and examples.~~ (done)
-* Implement the training prototype and later research-grade training loop.
+* ~~Implement the training prototype and later research-grade training loop.~~ (done)
 
 Recommended next milestone
 
-Public metrics/trace surfacing is now complete:
-`predict_with_call_patches_runner` accepts `PredictCallPatchesOptions` and
-returns `PredictResultWithCallMetrics` containing both `call_metrics` and
-`trace_events`. Trace collection is opt-in via `PredictCallPatchesOptions::with_trace()`.
+All planned milestones M1–M9 are now complete. The full training pipeline
+(M8 training prototype + M9 research-grade training) is implemented in
+`crates/larql-inference/src/training/`:
 
-Multi-token generation with call patches is now implemented via
-`generate_with_call_patches` / `generate_with_call_patches_runner` in
-`larql-inference/src/forward/predict/ffn.rs`. These thread a shared
-`MontyCallRuntime` through `WalkFfn` at every decode step, reset per-sequence
-state once at the start, and return `GenerateResultWithCallMetrics` with
-aggregate `call_metrics` and optional per-event `trace_events`.
+* `synthetic.rs` — synthetic task generator (arithmetic, date, string, unit, table, format).
+* `gate_calibration.rs` — logistic-regression gate calibration with hard negatives and margin loss.
+* `decoder_warmup.rs` — forced-call linear decoder warmup (teacher forcing) + `SurrogateDecoder`
+  for the surrogate backward prototype.
+* `evaluation.rs` — accuracy, gate P/R/F1, KL regression, reach probe, `print_m8_report`.
+* `toolformer_mining.rs` — Toolformer-style corpus mining for call-patch training data.
+* `joint_fine_tune.rs` — joint optimization of g/E/D/optional LoRA with the full M9 loss
+  (`CE_task + KL + fire_rate + delta_norm + surrogate_MSE`) and ablation framework.
 
-The next highest-leverage steps are production safety hardening, benchmarks,
-and the training pipeline (M8+).
+End-to-end demos:
+* `examples/training_prototype.rs` — M8 demo; all M8 exit criteria satisfied.
+* `examples/research_training.rs` — M9 demo; all M9 exit criteria satisfied
+  (loss decreases, gate P/R/F1 reported, no KL regression, ablations finite,
+  surrogate MSE finite, surrogate-vs-REINFORCE proxy comparison included).
+
+Remaining optional work:
+* Expand inline LQL `INPUT (...)` / `OUTPUT (...)` grammar if richer policy
+  syntax proves necessary in production.
+* Additional codec variants beyond learned linear (training-time codec learning
+  for top-k basis or sparse basis delta) if downstream use cases require it.
 
 Reading note
 
@@ -274,9 +289,29 @@ Fused GPU prefill + decode with call patches — complete:
   `supports_fused_prefill_with_call_patches` holds and a `backend` is supplied,
   otherwise falls back to the CPU Q4K cached driver or generic KV layer loop.
 
-Still incomplete:
+M8 training prototype — complete:
 
-* Training prototype (M8+).
+* Synthetic task generator: arithmetic, date arithmetic, string transforms, unit conversions,
+  table lookup, symbolic formatting — six task categories, seeded-random examples.
+* Forced-call decoder warmup (`LinearDecoder`, AdaGrad, teacher forcing, grad clipping).
+* Surrogate backward prototype (`SurrogateDecoder` approximates D∘M∘E; MSE alignment loss).
+* Gate calibration with hard negatives (`GateCalibrator`, BCE + margin + sparsity loss).
+* Evaluation harness: accuracy improvement, gate P/R/F1 + fire rate, KL/perplexity
+  regression check, next-token reach probe.
+* `examples/training_prototype.rs` demo; all M8 exit criteria satisfied.
+
+M9 research-grade training — complete:
+
+* Toolformer-style corpus mining (`mine_batch`): high-entropy candidate selection, loss-drop
+  filtering, hard-negative injection, per-batch `MiningSummary`.
+* Joint fine-tune of g/E/D/LoRA (`JointTrainer`, `joint_step`, `joint_epoch`): full M9 loss
+  with KL anchor, fire-rate sparsity penalty, delta regularisation, surrogate MSE term.
+* `LoraAdapter` (rank-r, AdaGrad) and `LinearEncoder` (residual → compact dict projection).
+* Ablation framework (`AblationConfig`, `run_ablation`): residual-delta vs logit-bias,
+  raw vs topk codec, no-LoRA vs LoRA, threshold/cooldown variants.
+* Surrogate-vs-REINFORCE proxy comparison in `examples/research_training.rs` (Step 5).
+* All M9 exit criteria satisfied: loss decreases, no KL regression detected, all ablation
+  variants produce finite loss, surrogate MSE finite.
 
 M6 learned linear codec artifact format — complete:
 
