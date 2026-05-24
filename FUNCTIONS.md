@@ -148,10 +148,28 @@ Locally confirmed in this repository since the original plan was written:
 * `ATTACH CALL` executor tests live in
   [crates/larql-lql/src/executor/tests.rs](crates/larql-lql/src/executor/tests.rs).
 
+Recently completed (M5 safety hardening, partial):
+
+* `MontyCallRuntime` now enforces `max_calls_per_sequence` and
+  `cooldown_tokens` from `CallTrigger` — both fields were previously defined
+  in the schema but ignored at runtime.
+* `MontyCallMetrics` gained `skipped_sequence_budget` and `skipped_cooldown`
+  counters.
+* Per-event trace surface: `CallOutcome` + `CallTraceEvent` types; enable with
+  `MontyCallRuntime::with_trace_events()`, drain with `take_trace_events()`.
+* `reset_sequence_state()` on `MontyCallRuntime` resets per-sequence fire
+  counts and cooldown positions between inference passes / generation sequences.
+* New tests: sequence budget enforcement, budget reset, cooldown enforcement,
+  trace event emission (Fired / SkippedTrigger / SkippedSequenceBudget /
+  SkippedCooldown), drain semantics, tracing-disabled no-op.
+
 Still incomplete:
 
-* Production trace-event surface for fired/skipped call details beyond aggregate
-  counters.
+* Dense/static FFN paths, Metal/GPU paths, full mmap/kquant paths, and batched
+  prefill/generation loop integration — call patches only execute on the
+  sparse CPU `WalkFfn` path today.
+* False-fire and residual-explosion tests (residual clamping is already
+  tested; dedicated named tests for these safety scenarios are not yet written).
 
 ⸻
 

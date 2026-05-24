@@ -79,6 +79,31 @@ pub struct CallOutput {
     pub logit_bias: Option<SparseLogitBias>,
 }
 
+/// Reason a call patch was skipped or failed. Carried by [`CallTraceEvent`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallOutcome {
+    Fired,
+    /// Trigger thresholds (score / margin / rank / per-token budget) not met.
+    SkippedTrigger,
+    /// `max_calls_per_sequence` exhausted for this patch.
+    SkippedSequenceBudget,
+    /// `cooldown_tokens` window not yet expired since the last fired position.
+    SkippedCooldown,
+    /// Call completed but exceeded the `time_us` wall-clock budget.
+    TimedOut,
+    /// Runner or decode error; detail attached.
+    Failed(String),
+}
+
+/// One event emitted by [`MontyCallRuntime`] when trace collection is enabled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallTraceEvent {
+    pub layer: usize,
+    pub feature: usize,
+    pub position: usize,
+    pub outcome: CallOutcome,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MontyCallMetrics {
     pub attempted: u64,
@@ -89,6 +114,10 @@ pub struct MontyCallMetrics {
     /// The output is discarded and the position is treated as if the
     /// call was not fired (output zeroed, metric incremented).
     pub timed_out: u64,
+    /// Calls skipped because `max_calls_per_sequence` was exhausted.
+    pub skipped_sequence_budget: u64,
+    /// Calls skipped because `cooldown_tokens` window had not expired.
+    pub skipped_cooldown: u64,
 }
 
 pub trait CallProgramRunner {
@@ -218,6 +247,15 @@ pub trait WalkCallRuntime {
 pub struct MontyCallRuntime<R> {
     runner: R,
     metrics: MontyCallMetrics,
+    /// Number of times each `(layer, feature)` patch has fired in the current
+    /// sequence. Reset by [`reset_sequence_state`].
+    sequence_call_counts: std::collections::HashMap<(usize, usize), usize>,
+    /// Token position at which each patch last fired. Used to enforce
+    /// `cooldown_tokens`.
+    last_fired_positions: std::collections::HashMap<(usize, usize), usize>,
+    /// Per-event trace buffer. `None` = disabled. Enable with
+    /// [`with_trace_events`]; drain with [`take_trace_events`].
+    trace_events: Option<Vec<CallTraceEvent>>,
 }
 
 impl<R> MontyCallRuntime<R> {
@@ -225,6 +263,9 @@ impl<R> MontyCallRuntime<R> {
         Self {
             runner,
             metrics: MontyCallMetrics::default(),
+            sequence_call_counts: std::collections::HashMap::new(),
+            last_fired_positions: std::collections::HashMap::new(),
+            trace_events: None,
         }
     }
 
@@ -234,6 +275,39 @@ impl<R> MontyCallRuntime<R> {
 
     pub fn into_runner(self) -> R {
         self.runner
+    }
+
+    /// Enable per-event trace collection. Call [`take_trace_events`] to drain.
+    pub fn with_trace_events(mut self) -> Self {
+        self.trace_events = Some(Vec::new());
+        self
+    }
+
+    /// Drain and return accumulated trace events. Returns empty when tracing is
+    /// disabled or no events have been recorded since the last drain.
+    pub fn take_trace_events(&mut self) -> Vec<CallTraceEvent> {
+        self.trace_events
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Reset per-sequence state (call counts and cooldown positions). Call
+    /// this between inference passes / generation sequences.
+    pub fn reset_sequence_state(&mut self) {
+        self.sequence_call_counts.clear();
+        self.last_fired_positions.clear();
+    }
+
+    fn emit_trace(&mut self, layer: usize, feature: usize, position: usize, outcome: CallOutcome) {
+        if let Some(events) = self.trace_events.as_mut() {
+            events.push(CallTraceEvent {
+                layer,
+                feature,
+                position,
+                outcome,
+            });
+        }
     }
 }
 
@@ -246,8 +320,53 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
         hidden_size: usize,
     ) -> Result<Option<CallOutput>, CallError> {
         self.metrics.attempted += 1;
+        let patch_key = (call.layer, call.feature);
+
+        // Per-sequence budget check.
+        if let Some(max_seq) = call.trigger.max_calls_per_sequence {
+            let count = self
+                .sequence_call_counts
+                .get(&patch_key)
+                .copied()
+                .unwrap_or(0);
+            if count >= max_seq {
+                self.metrics.skipped += 1;
+                self.metrics.skipped_sequence_budget += 1;
+                self.emit_trace(
+                    call.layer,
+                    call.feature,
+                    ctx.position,
+                    CallOutcome::SkippedSequenceBudget,
+                );
+                return Ok(None);
+            }
+        }
+
+        // Cooldown check.
+        if let Some(cooldown) = call.trigger.cooldown_tokens {
+            if let Some(&last_pos) = self.last_fired_positions.get(&patch_key) {
+                if ctx.position < last_pos + cooldown {
+                    self.metrics.skipped += 1;
+                    self.metrics.skipped_cooldown += 1;
+                    self.emit_trace(
+                        call.layer,
+                        call.feature,
+                        ctx.position,
+                        CallOutcome::SkippedCooldown,
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
         if !should_fire(&call.trigger, candidate) {
             self.metrics.skipped += 1;
+            self.emit_trace(
+                call.layer,
+                call.feature,
+                ctx.position,
+                CallOutcome::SkippedTrigger,
+            );
             return Ok(None);
         }
 
@@ -257,6 +376,13 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
             Ok(raw) => raw,
             Err(err) => {
                 self.metrics.failed += 1;
+                let detail = err.to_string();
+                self.emit_trace(
+                    call.layer,
+                    call.feature,
+                    ctx.position,
+                    CallOutcome::Failed(detail),
+                );
                 return handle_failure(call, hidden_size, err);
             }
         };
@@ -264,6 +390,12 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
         if call.limits.time_us > 0 && elapsed_us > call.limits.time_us {
             self.metrics.timed_out += 1;
             self.metrics.skipped += 1;
+            self.emit_trace(
+                call.layer,
+                call.feature,
+                ctx.position,
+                CallOutcome::TimedOut,
+            );
             return Ok(None);
         }
 
@@ -271,11 +403,26 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
             Ok(output) => output,
             Err(err) => {
                 self.metrics.failed += 1;
+                let detail = err.to_string();
+                self.emit_trace(
+                    call.layer,
+                    call.feature,
+                    ctx.position,
+                    CallOutcome::Failed(detail),
+                );
                 return handle_failure(call, hidden_size, err);
             }
         };
         apply_safety(&mut output, &call.safety);
         self.metrics.fired += 1;
+        *self.sequence_call_counts.entry(patch_key).or_insert(0) += 1;
+        self.last_fired_positions.insert(patch_key, ctx.position);
+        self.emit_trace(
+            call.layer,
+            call.feature,
+            ctx.position,
+            CallOutcome::Fired,
+        );
         Ok(Some(output))
     }
 }
@@ -1332,5 +1479,343 @@ mod tests {
             .expect("pydantic_monty should execute the call patch");
 
         assert_eq!(output, json!({"residual_delta": [2.0, -4.0, 1.0]}));
+    }
+
+    // ── Per-sequence budget and cooldown tests ────────────────────────────────
+
+    #[test]
+    fn runtime_enforces_sequence_budget() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.trigger.max_calls_per_sequence = Some(2);
+        let ctx = |position| CallContext {
+            layer: 2,
+            position,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let candidate = CallCandidate {
+            rank: 1,
+            score: 5.0,
+            margin: Some(1.0),
+            calls_already_fired: 0,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        });
+
+        // First two calls succeed.
+        assert!(runtime.execute_call(&call, candidate, &ctx(0), 3).unwrap().is_some());
+        assert!(runtime.execute_call(&call, candidate, &ctx(1), 3).unwrap().is_some());
+        // Third call hits the sequence budget.
+        assert!(runtime.execute_call(&call, candidate, &ctx(2), 3).unwrap().is_none());
+
+        assert_eq!(runtime.metrics().fired, 2);
+        assert_eq!(runtime.metrics().skipped_sequence_budget, 1);
+        assert_eq!(runtime.metrics().skipped, 1);
+    }
+
+    #[test]
+    fn runtime_sequence_budget_resets_on_reset_sequence_state() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.trigger.max_calls_per_sequence = Some(1);
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let candidate = CallCandidate {
+            rank: 1,
+            score: 5.0,
+            margin: Some(1.0),
+            calls_already_fired: 0,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        });
+
+        // Fire once — fills the budget.
+        assert!(runtime.execute_call(&call, candidate, &ctx, 3).unwrap().is_some());
+        // Budget exhausted.
+        assert!(runtime.execute_call(&call, candidate, &ctx, 3).unwrap().is_none());
+
+        // After reset, budget is fresh again.
+        runtime.reset_sequence_state();
+        assert!(runtime.execute_call(&call, candidate, &ctx, 3).unwrap().is_some());
+        assert_eq!(runtime.metrics().fired, 2);
+    }
+
+    #[test]
+    fn runtime_enforces_cooldown() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.trigger.cooldown_tokens = Some(3);
+        let candidate = CallCandidate {
+            rank: 1,
+            score: 5.0,
+            margin: Some(1.0),
+            calls_already_fired: 0,
+        };
+        let ctx = |position: usize| CallContext {
+            layer: 2,
+            position,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        });
+
+        // Fire at position 0.
+        assert!(runtime.execute_call(&call, candidate, &ctx(0), 3).unwrap().is_some());
+
+        // Positions 1 and 2 are within the 3-token cooldown window.
+        assert!(runtime.execute_call(&call, candidate, &ctx(1), 3).unwrap().is_none());
+        assert!(runtime.execute_call(&call, candidate, &ctx(2), 3).unwrap().is_none());
+
+        // Position 3 = last_fired(0) + cooldown(3) — cooldown expired, fires again.
+        assert!(runtime.execute_call(&call, candidate, &ctx(3), 3).unwrap().is_some());
+
+        assert_eq!(runtime.metrics().fired, 2);
+        assert_eq!(runtime.metrics().skipped_cooldown, 2);
+    }
+
+    // ── Trace event tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn runtime_emits_fired_trace_event_when_tracing_enabled() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        let ctx = CallContext {
+            layer: 2,
+            position: 4,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        })
+        .with_trace_events();
+
+        runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        let events = runtime.take_trace_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].layer, 2);
+        assert_eq!(events[0].feature, 7);
+        assert_eq!(events[0].position, 4);
+        assert!(matches!(events[0].outcome, CallOutcome::Fired));
+    }
+
+    #[test]
+    fn runtime_emits_skipped_trigger_trace_event() {
+        let call = call(); // score_threshold = Some(3.0), rank must be ≤ 2
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        })
+        .with_trace_events();
+
+        runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 99,   // fails require_top_k = 2
+                    score: 9.0,
+                    margin: Some(9.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        let events = runtime.take_trace_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].outcome, CallOutcome::SkippedTrigger));
+    }
+
+    #[test]
+    fn runtime_emits_sequence_budget_trace_event() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.trigger.max_calls_per_sequence = Some(1);
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let candidate = CallCandidate {
+            rank: 1,
+            score: 5.0,
+            margin: Some(1.0),
+            calls_already_fired: 0,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        })
+        .with_trace_events();
+
+        runtime.execute_call(&call, candidate, &ctx, 3).unwrap();
+        runtime.execute_call(&call, candidate, &ctx, 3).unwrap();
+
+        let events = runtime.take_trace_events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].outcome, CallOutcome::Fired));
+        assert!(matches!(events[1].outcome, CallOutcome::SkippedSequenceBudget));
+    }
+
+    #[test]
+    fn runtime_emits_cooldown_trace_event() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        call.trigger.cooldown_tokens = Some(5);
+        let candidate = CallCandidate {
+            rank: 1,
+            score: 5.0,
+            margin: Some(1.0),
+            calls_already_fired: 0,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        })
+        .with_trace_events();
+
+        runtime
+            .execute_call(
+                &call,
+                candidate,
+                &CallContext {
+                    layer: 2,
+                    position: 0,
+                    residual: &[1.0, 2.0, 3.0],
+                    token_ids: &[],
+                    token_text: None,
+                },
+                3,
+            )
+            .unwrap();
+        runtime
+            .execute_call(
+                &call,
+                candidate,
+                &CallContext {
+                    layer: 2,
+                    position: 2,
+                    residual: &[1.0, 2.0, 3.0],
+                    token_ids: &[],
+                    token_text: None,
+                },
+                3,
+            )
+            .unwrap();
+
+        let events = runtime.take_trace_events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].outcome, CallOutcome::Fired));
+        assert!(matches!(events[1].outcome, CallOutcome::SkippedCooldown));
+    }
+
+    #[test]
+    fn runtime_trace_events_drained_on_take() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        })
+        .with_trace_events();
+
+        runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        let first_drain = runtime.take_trace_events();
+        let second_drain = runtime.take_trace_events();
+        assert_eq!(first_drain.len(), 1);
+        assert!(second_drain.is_empty(), "second drain should be empty");
+    }
+
+    #[test]
+    fn runtime_no_trace_events_when_not_enabled() {
+        let mut call = call();
+        call.trigger.score_threshold = None;
+        call.trigger.margin_threshold = None;
+        let ctx = CallContext {
+            layer: 2,
+            position: 0,
+            residual: &[1.0, 2.0, 3.0],
+            token_ids: &[],
+            token_text: None,
+        };
+        // No .with_trace_events() — trace_events remains None.
+        let mut runtime = MontyCallRuntime::new(StaticRunner {
+            output: json!({"delta": [0.1, 0.2, 0.3]}),
+        });
+
+        runtime
+            .execute_call(
+                &call,
+                CallCandidate {
+                    rank: 1,
+                    score: 5.0,
+                    margin: Some(1.0),
+                    calls_already_fired: 0,
+                },
+                &ctx,
+                3,
+            )
+            .unwrap();
+
+        assert!(runtime.take_trace_events().is_empty());
     }
 }
