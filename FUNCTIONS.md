@@ -58,6 +58,11 @@ Already implemented in-tree
       firing, non-fired triggers leaving next-token logits unchanged, and
       loaded-without-runtime call patches being skipped instead of treated as
       static rows.
+    * Public prediction helpers `predict_with_call_patches(...)` and
+      `predict_with_call_patches_runner(...)` thread `PatchedVindex` +
+      Monty call runtime hooks into `WalkFfn` and return
+      `PredictResultWithCallMetrics` so callers can observe attempted/fired/
+      skipped/failed/timeout counters without constructing `WalkFfn` directly.
 
 Still remaining
 
@@ -145,7 +150,8 @@ Locally confirmed in this repository since the original plan was written:
 
 Still incomplete:
 
-* Production API surface for exposing call metrics/traces to callers.
+* Production trace-event surface for fired/skipped call details beyond aggregate
+  counters.
 
 ⸻
 

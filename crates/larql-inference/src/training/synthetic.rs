@@ -134,7 +134,9 @@ pub fn date_delta_examples(n: usize, seed: u64) -> Vec<SyntheticExample> {
 
 /// String-reverse examples: "Reverse 'hello': "
 pub fn string_transform_examples(n: usize, seed: u64) -> Vec<SyntheticExample> {
-    let words = ["hello", "world", "rust", "larql", "patch", "gate", "monty", "call"];
+    let words = [
+        "hello", "world", "rust", "larql", "patch", "gate", "monty", "call",
+    ];
     let mut rng = Lcg64(seed.wrapping_add(2));
     (0..n)
         .map(|_| {
@@ -253,7 +255,9 @@ pub fn build_dataset(examples_per_category: usize, seed: u64) -> Vec<SyntheticEx
 struct Lcg64(u64);
 impl Lcg64 {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005)
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         self.0 >> 33
     }
@@ -295,7 +299,14 @@ mod tests {
     fn all_categories_present_in_dataset() {
         let ds = build_dataset(4, 1);
         use TaskCategory::*;
-        for cat in [ArithmeticNorm, DateDelta, StringTransform, UnitConversion, TableLookup, SymbolicFormat] {
+        for cat in [
+            ArithmeticNorm,
+            DateDelta,
+            StringTransform,
+            UnitConversion,
+            TableLookup,
+            SymbolicFormat,
+        ] {
             assert!(ds.iter().any(|e| e.category == cat), "missing {:?}", cat);
         }
     }

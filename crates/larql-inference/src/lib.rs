@@ -65,12 +65,12 @@ pub mod layer_graph;
 pub mod model;
 pub mod monty_call;
 pub mod prompt;
-pub mod training;
 pub mod residual;
 pub mod residual_diff;
 pub mod test_utils;
 pub mod tokenizer;
 pub mod trace;
+pub mod training;
 pub mod vindex;
 
 // Re-export dependencies for downstream crates.
@@ -208,10 +208,11 @@ pub use kv_engine::{DecodeStageSummary, EngineInfo, KvEngine};
 pub use forward::{
     apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals, capture_residuals,
     capture_spec_residuals, forward_from_layer, forward_to_layer, hidden_to_raw_logits,
-    infer_patched, logit_lens_top1, predict, predict_from_hidden, predict_with_ffn,
-    predict_with_ffn_attention, predict_with_router, predict_with_strategy, run_memit,
-    run_memit_with_target_opt, trace_forward, trace_forward_full, walk_trace_from_residuals,
-    InferenceWeights, KnnOverride, LayerAttentionCapture, MemitFact, MemitResult, PredictResult,
+    infer_patched, logit_lens_top1, predict, predict_from_hidden, predict_with_call_patches,
+    predict_with_call_patches_runner, predict_with_ffn, predict_with_ffn_attention,
+    predict_with_router, predict_with_strategy, run_memit, run_memit_with_target_opt,
+    trace_forward, trace_forward_full, walk_trace_from_residuals, InferenceWeights, KnnOverride,
+    LayerAttentionCapture, MemitFact, MemitResult, PredictResult, PredictResultWithCallMetrics,
     TargetDeltaOpts,
 };
 // Crate-root layer_graph re-exports — kept for any name with external use

@@ -29,7 +29,9 @@ fn main() {
     let base = VectorIndex::new(vec![None, None], vec![None, None], 2, hidden);
     let mut patched = PatchedVindex::new(base);
 
-    let gate_vec: Vec<f32> = (0..hidden).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+    let gate_vec: Vec<f32> = (0..hidden)
+        .map(|i| if i == 0 { 1.0 } else { 0.0 })
+        .collect();
     let call = CallPatchOp {
         layer: 0,
         feature: 42,
@@ -71,7 +73,10 @@ fn main() {
     let q = Array1::from_vec(gate_vec.clone());
     let hits = patched.gate_knn(0, &q, 1);
     assert_eq!(hits[0].0, 42, "call gate should score at rank 1");
-    println!("✓ gate_knn returns call feature at rank 1 (score={:.3})", hits[0].1);
+    println!(
+        "✓ gate_knn returns call feature at rank 1 (score={:.3})",
+        hits[0].1
+    );
 
     // ── 2. Serialize the overlay into a VindexPatch and save ─────────────────
     let mut call_with_hash = call.clone();
@@ -95,7 +100,11 @@ fn main() {
     let loaded = VindexPatch::load(&vlp_path).expect("load .vlp");
     let counts = loaded.counts_detailed();
     assert_eq!(counts.calls, 1, "loaded patch should have 1 call op");
-    println!("✓ Loaded .vlp: {} op(s), calls={}", loaded.len(), counts.calls);
+    println!(
+        "✓ Loaded .vlp: {} op(s), calls={}",
+        loaded.len(),
+        counts.calls
+    );
 
     let PatchOp::Call(ref loaded_call) = loaded.operations[0] else {
         panic!("expected Call op");
@@ -107,10 +116,7 @@ fn main() {
         Some(0.5),
         "trigger round-trips"
     );
-    assert_eq!(
-        loaded_call.limits.time_us, 250,
-        "limits round-trip"
-    );
+    assert_eq!(loaded_call.limits.time_us, 250, "limits round-trip");
     assert_eq!(
         loaded_call.safety.residual_clamp_norm,
         Some(2.0),
@@ -120,13 +126,9 @@ fn main() {
     assert!(code_hash.starts_with("sha256:"), "code_hash present");
     println!("✓ All fields round-trip correctly (code_hash={code_hash:.20}…)");
 
-    let loaded_gate = decode_gate_vector(loaded_call.gate_vector_b64.as_ref().unwrap())
-        .expect("decode gate");
-    assert_eq!(
-        loaded_gate.len(),
-        hidden,
-        "gate vector width preserved"
-    );
+    let loaded_gate =
+        decode_gate_vector(loaded_call.gate_vector_b64.as_ref().unwrap()).expect("decode gate");
+    assert_eq!(loaded_gate.len(), hidden, "gate vector width preserved");
     assert!(
         (loaded_gate[0] - 1.0).abs() < 1e-6,
         "gate vector values preserved"
@@ -144,7 +146,10 @@ fn main() {
 
     let hits2 = patched2.gate_knn(0, &q, 1);
     assert_eq!(hits2[0].0, 42, "gate participates in KNN after apply_patch");
-    println!("✓ APPLY round-trip: call_patch at L0 F42, gate_knn rank 1 = F{}", hits2[0].0);
+    println!(
+        "✓ APPLY round-trip: call_patch at L0 F42, gate_knn rank 1 = F{}",
+        hits2[0].0
+    );
 
     println!("\n=== Round-trip complete ===");
 }

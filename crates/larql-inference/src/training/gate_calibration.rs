@@ -73,13 +73,25 @@ pub struct GateLossAccumulator {
 
 impl GateLossAccumulator {
     pub fn bce_mean(&self) -> f32 {
-        if self.n_steps == 0 { 0.0 } else { (self.bce_sum / self.n_steps as f64) as f32 }
+        if self.n_steps == 0 {
+            0.0
+        } else {
+            (self.bce_sum / self.n_steps as f64) as f32
+        }
     }
     pub fn total_mean(&self) -> f32 {
-        if self.n_steps == 0 { 0.0 } else { (self.total_sum / self.n_steps as f64) as f32 }
+        if self.n_steps == 0 {
+            0.0
+        } else {
+            (self.total_sum / self.n_steps as f64) as f32
+        }
     }
     pub fn fire_rate(&self) -> f32 {
-        if self.n_total == 0 { 0.0 } else { self.n_fired as f32 / self.n_total as f32 }
+        if self.n_total == 0 {
+            0.0
+        } else {
+            self.n_fired as f32 / self.n_total as f32
+        }
     }
 }
 
@@ -105,7 +117,11 @@ impl GateCalibrator {
     /// Create from an existing gate vector (e.g., warm-start from a prior patch).
     pub fn from_gate(gate: Vec<f32>, config: GateCalibrationConfig) -> Self {
         let n = gate.len();
-        Self { gate, sq_grad: vec![1e-8; n], config }
+        Self {
+            gate,
+            sq_grad: vec![1e-8; n],
+            config,
+        }
     }
 
     /// Score a residual: dot product with the gate.
@@ -213,11 +229,7 @@ impl GateCalibrator {
     }
 
     /// Evaluate precision, recall, and F1 at a given score threshold.
-    pub fn precision_recall_f1(
-        &self,
-        examples: &[GateExample],
-        threshold: f32,
-    ) -> (f32, f32, f32) {
+    pub fn precision_recall_f1(&self, examples: &[GateExample], threshold: f32) -> (f32, f32, f32) {
         let mut tp = 0u32;
         let mut fp = 0u32;
         let mut fn_ = 0u32;
@@ -233,8 +245,16 @@ impl GateCalibrator {
             }
         }
 
-        let precision = if tp + fp == 0 { 0.0 } else { tp as f32 / (tp + fp) as f32 };
-        let recall = if tp + fn_ == 0 { 0.0 } else { tp as f32 / (tp + fn_) as f32 };
+        let precision = if tp + fp == 0 {
+            0.0
+        } else {
+            tp as f32 / (tp + fp) as f32
+        };
+        let recall = if tp + fn_ == 0 {
+            0.0
+        } else {
+            tp as f32 / (tp + fn_) as f32
+        };
         let f1 = if precision + recall == 0.0 {
             0.0
         } else {
@@ -265,7 +285,11 @@ mod tests {
     use super::*;
 
     fn make_example(residual: Vec<f32>, label: f32) -> GateExample {
-        GateExample { residual, label, paired_negative: None }
+        GateExample {
+            residual,
+            label,
+            paired_negative: None,
+        }
     }
 
     #[test]
@@ -279,7 +303,10 @@ mod tests {
     fn bce_loss_is_zero_for_perfect_prediction() {
         let p_close_to_one = 1.0 - 1e-6;
         let loss = bce(p_close_to_one, 1.0);
-        assert!(loss < 0.01, "bce should be near zero for perfect prediction, got {loss}");
+        assert!(
+            loss < 0.01,
+            "bce should be near zero for perfect prediction, got {loss}"
+        );
     }
 
     #[test]

@@ -86,10 +86,7 @@ fn main() {
     exec(&mut save_session, "SAVE PATCH;", "SAVE PATCH");
 
     let saved = larql_vindex::VindexPatch::load(&vlp_path).expect("load saved patch");
-    println!(
-        "\nSaved patch: {} operations",
-        saved.operations.len()
-    );
+    println!("\nSaved patch: {} operations", saved.operations.len());
     let counts = saved.counts_detailed();
     println!(
         "  inserts={}, updates={}, deletes={}, calls={}",
@@ -137,8 +134,8 @@ fn main() {
 }
 
 fn build_synthetic_vindex(dir: &Path) {
-    use larql_vindex::{FeatureMeta, VectorIndex, VindexConfig};
     use larql_models::TopKEntry;
+    use larql_vindex::{FeatureMeta, VectorIndex, VindexConfig};
     use ndarray::Array2;
 
     let hidden = 4;
@@ -171,8 +168,16 @@ fn build_synthetic_vindex(dir: &Path) {
     let index = VectorIndex::new(
         vec![Some(gate.clone()), Some(gate.clone())],
         vec![
-            Some(vec![meta_entry("A", 1), meta_entry("B", 2), meta_entry("C", 3)]),
-            Some(vec![meta_entry("D", 4), meta_entry("E", 5), meta_entry("F", 6)]),
+            Some(vec![
+                meta_entry("A", 1),
+                meta_entry("B", 2),
+                meta_entry("C", 3),
+            ]),
+            Some(vec![
+                meta_entry("D", 4),
+                meta_entry("E", 5),
+                meta_entry("F", 6),
+            ]),
         ],
         num_layers,
         hidden,
@@ -206,7 +211,8 @@ fn build_synthetic_vindex(dir: &Path) {
 
     let embed_bytes = vec![0u8; vocab_size * hidden * 4];
     std::fs::write(dir.join("embeddings.bin"), embed_bytes).unwrap();
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 }
 

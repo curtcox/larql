@@ -29,10 +29,18 @@ pub struct GatePrediction {
 }
 
 impl GatePrediction {
-    pub fn is_tp(&self) -> bool { self.fired && self.should_fire }
-    pub fn is_fp(&self) -> bool { self.fired && !self.should_fire }
-    pub fn is_fn(&self) -> bool { !self.fired && self.should_fire }
-    pub fn is_tn(&self) -> bool { !self.fired && !self.should_fire }
+    pub fn is_tp(&self) -> bool {
+        self.fired && self.should_fire
+    }
+    pub fn is_fp(&self) -> bool {
+        self.fired && !self.should_fire
+    }
+    pub fn is_fn(&self) -> bool {
+        !self.fired && self.should_fire
+    }
+    pub fn is_tn(&self) -> bool {
+        !self.fired && !self.should_fire
+    }
 }
 
 /// Summary of gate precision/recall/F1 over a dataset.
@@ -116,16 +124,37 @@ pub fn gate_metrics(predictions: &[GatePrediction]) -> GateMetrics {
     let total = predictions.len() as u64;
     let fired = tp + fp;
 
-    let precision = if fired == 0 { 0.0 } else { tp as f32 / fired as f32 };
-    let recall = if tp + fn_ == 0 { 0.0 } else { tp as f32 / (tp + fn_) as f32 };
+    let precision = if fired == 0 {
+        0.0
+    } else {
+        tp as f32 / fired as f32
+    };
+    let recall = if tp + fn_ == 0 {
+        0.0
+    } else {
+        tp as f32 / (tp + fn_) as f32
+    };
     let f1 = if precision + recall == 0.0 {
         0.0
     } else {
         2.0 * precision * recall / (precision + recall)
     };
-    let fire_rate = if total == 0 { 0.0 } else { fired as f32 / total as f32 };
+    let fire_rate = if total == 0 {
+        0.0
+    } else {
+        fired as f32 / total as f32
+    };
 
-    GateMetrics { precision, recall, f1, tp, fp, fn_, tn, fire_rate }
+    GateMetrics {
+        precision,
+        recall,
+        f1,
+        tp,
+        fp,
+        fn_,
+        tn,
+        fire_rate,
+    }
 }
 
 // ── KL / perplexity regression check ─────────────────────────────────────────
@@ -139,7 +168,11 @@ pub fn kl_divergence(log_p: &[f32], log_q: &[f32]) -> f32 {
         .zip(log_q.iter())
         .map(|(lp, lq)| {
             let p = lp.exp();
-            if p < 1e-9 { 0.0 } else { p * (lp - lq) }
+            if p < 1e-9 {
+                0.0
+            } else {
+                p * (lp - lq)
+            }
         })
         .sum()
 }
@@ -158,7 +191,14 @@ pub fn perplexity(log_q_per_position: &[f32], targets: &[usize]) -> f32 {
     let mean_ce: f32 = log_q_per_position
         .iter()
         .zip(targets.iter())
-        .map(|(log_q, &t)| -log_q.min(0.0) + if *log_q_per_position.get(t).unwrap_or(log_q) < 0.0 { 0.0 } else { 0.0 })
+        .map(|(log_q, &t)| {
+            -log_q.min(0.0)
+                + if *log_q_per_position.get(t).unwrap_or(log_q) < 0.0 {
+                    0.0
+                } else {
+                    0.0
+                }
+        })
         .sum::<f32>()
         / targets.len() as f32;
     mean_ce.exp()
@@ -259,15 +299,25 @@ pub fn print_m8_report(
     println!("  Recall   : {:.3}", gate.recall);
     println!("  F1       : {:.3}", gate.f1);
     println!("  Fire rate: {:.2}%", gate.fire_rate * 100.0);
-    println!("  TP={} FP={} FN={} TN={}", gate.tp, gate.fp, gate.fn_, gate.tn);
+    println!(
+        "  TP={} FP={} FN={} TN={}",
+        gate.tp, gate.fp, gate.fn_, gate.tn
+    );
     println!();
-    println!("No-regression check (tolerance={:.0}%):", regression.regression_tolerance * 100.0);
+    println!(
+        "No-regression check (tolerance={:.0}%):",
+        regression.regression_tolerance * 100.0
+    );
     println!("  Baseline PPL : {:.3}", regression.baseline_perplexity);
     println!("  Patched PPL  : {:.3}", regression.patched_perplexity);
     println!("  Mean KL      : {:.4}", regression.mean_kl);
     println!(
         "  Regression   : {}",
-        if regression.regression_detected { "DETECTED" } else { "none" }
+        if regression.regression_detected {
+            "DETECTED"
+        } else {
+            "none"
+        }
     );
     println!();
     println!("Next-token reach probe:");
@@ -293,23 +343,27 @@ mod tests {
 
     #[test]
     fn synthetic_accuracy_perfect() {
-        let preds: Vec<(String, String)> =
-            vec![("a".into(), "a".into()), ("b".into(), "b".into())];
+        let preds: Vec<(String, String)> = vec![("a".into(), "a".into()), ("b".into(), "b".into())];
         assert_eq!(synthetic_accuracy(&preds), 1.0);
     }
 
     #[test]
     fn synthetic_accuracy_half() {
-        let preds: Vec<(String, String)> =
-            vec![("a".into(), "a".into()), ("x".into(), "b".into())];
+        let preds: Vec<(String, String)> = vec![("a".into(), "a".into()), ("x".into(), "b".into())];
         assert_eq!(synthetic_accuracy(&preds), 0.5);
     }
 
     #[test]
     fn gate_metrics_all_correct() {
         let preds: Vec<GatePrediction> = vec![
-            GatePrediction { fired: true, should_fire: true },
-            GatePrediction { fired: false, should_fire: false },
+            GatePrediction {
+                fired: true,
+                should_fire: true,
+            },
+            GatePrediction {
+                fired: false,
+                should_fire: false,
+            },
         ];
         let m = gate_metrics(&preds);
         assert_eq!(m.precision, 1.0);
@@ -320,8 +374,14 @@ mod tests {
     #[test]
     fn gate_metrics_all_false_positives() {
         let preds: Vec<GatePrediction> = vec![
-            GatePrediction { fired: true, should_fire: false },
-            GatePrediction { fired: true, should_fire: false },
+            GatePrediction {
+                fired: true,
+                should_fire: false,
+            },
+            GatePrediction {
+                fired: true,
+                should_fire: false,
+            },
         ];
         let m = gate_metrics(&preds);
         assert_eq!(m.precision, 0.0);
@@ -333,7 +393,10 @@ mod tests {
     fn kl_divergence_identical_distributions_is_zero() {
         let log_p: Vec<f32> = vec![-1.0, -2.0, -3.0];
         let kl = kl_divergence(&log_p, &log_p);
-        assert!(kl.abs() < 1e-5, "KL of identical distributions should be 0, got {kl}");
+        assert!(
+            kl.abs() < 1e-5,
+            "KL of identical distributions should be 0, got {kl}"
+        );
     }
 
     #[test]
@@ -342,7 +405,7 @@ mod tests {
         // Baseline: uniform; patched: concentrate mass on wrong token.
         let base_lp: Vec<f32> = vec![-1.386; vocab]; // log(0.25)
         let bad_lp: Vec<f32> = vec![-0.1, -3.0, -3.0, -3.0]; // mass on token 0
-        // Target is token 1 (not token 0), so patched has higher CE.
+                                                             // Target is token 1 (not token 0), so patched has higher CE.
         let pairs = vec![(base_lp.clone(), bad_lp.clone(), 1usize)];
         let rep = regression_report(&pairs, 0.05);
         assert!(

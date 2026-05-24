@@ -8,6 +8,16 @@ use super::types::{LayerAttentionCapture, LayerMode, PredictResult, PredictResul
 use crate::attention::SharedKV;
 use crate::ffn::{FfnBackend, LayerFfnRouter};
 use crate::model::ModelWeights;
+use crate::monty_call::{CallProgramRunner, MontyCallMetrics, MontyCallRuntime, MontyVmRunner};
+use crate::vindex::{WalkFfn, WalkFfnConfig};
+use std::cell::RefCell;
+
+/// Prediction result plus runtime call-patch counters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredictResultWithCallMetrics {
+    pub predictions: Vec<(String, f64)>,
+    pub call_metrics: MontyCallMetrics,
+}
 
 /// Run a full forward pass with a custom FFN backend for all layers.
 pub fn predict_with_ffn(
@@ -49,6 +59,55 @@ pub fn predict_with_ffn(
     }
 
     logits_to_predictions(weights, &h, tokenizer, top_k, 1.0)
+}
+
+/// Run a vindex-backed forward pass with runtime call patches enabled.
+///
+/// This is the public inference entry point for callers that have a
+/// `PatchedVindex` and want both next-token predictions and call-patch
+/// observability without manually constructing `WalkFfn`.
+pub fn predict_with_call_patches(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    top_k: usize,
+    patched: &larql_vindex::PatchedVindex,
+    config: WalkFfnConfig,
+) -> PredictResultWithCallMetrics {
+    predict_with_call_patches_runner(
+        weights,
+        tokenizer,
+        token_ids,
+        top_k,
+        patched,
+        config,
+        MontyVmRunner::new(),
+    )
+}
+
+/// Run a vindex-backed forward pass with runtime call patches enabled and a
+/// caller-supplied runner. This is primarily useful for embedding tests,
+/// deterministic fakes, or hosted Monty runners.
+pub fn predict_with_call_patches_runner<R: CallProgramRunner>(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    top_k: usize,
+    patched: &larql_vindex::PatchedVindex,
+    config: WalkFfnConfig,
+    runner: R,
+) -> PredictResultWithCallMetrics {
+    let runtime = RefCell::new(MontyCallRuntime::new(runner));
+    let ffn = WalkFfn::from_config(weights, patched, config)
+        .with_call_patches(patched)
+        .with_call_runtime(&runtime);
+    let result = predict_with_ffn(weights, tokenizer, token_ids, top_k, &ffn);
+    drop(ffn);
+    let call_metrics = runtime.borrow().metrics();
+    PredictResultWithCallMetrics {
+        predictions: result.predictions,
+        call_metrics,
+    }
 }
 
 /// Run a full forward pass with a custom FFN backend, capturing attention weights
@@ -166,7 +225,20 @@ pub fn predict_with_strategy(
 mod tests {
     use super::*;
     use crate::ffn::{LayerFfnRouter, WeightFfn};
-    use crate::test_utils::TestFixtures;
+    use crate::monty_call::{CallError, CallProgramRunner};
+    use crate::test_utils::{attach_feature_major_f32_to_test_vindex, TestFixtures};
+    use larql_vindex::{CallPatchOp, CallResourceLimits, CallSafetyPolicy, CallTrigger};
+    use serde_json::{json, Value};
+
+    struct StaticRunner {
+        hidden: usize,
+    }
+
+    impl CallProgramRunner for StaticRunner {
+        fn run(&mut self, _call: &CallPatchOp, _input: Value) -> Result<Value, CallError> {
+            Ok(json!({"residual_delta": vec![1.0f32; self.hidden]}))
+        }
+    }
 
     #[test]
     fn predict_with_ffn_attention_returns_attention_and_residuals() {
@@ -193,6 +265,44 @@ mod tests {
         let router = LayerFfnRouter::uniform(&ffn, fx.weights.num_layers);
         let result = predict_with_router(&fx.weights, &fx.tokenizer, &[0u32, 1], 3, &router);
         assert!(result.predictions.len() <= 3);
+    }
+
+    #[test]
+    fn predict_with_call_patches_runner_exposes_metrics() {
+        let mut fx = TestFixtures::build();
+        attach_feature_major_f32_to_test_vindex(&fx.weights, &mut fx.index);
+        let hidden = fx.weights.hidden_size;
+        let first_hidden = embed_tokens(&fx.weights, &[0u32]).row(0).to_vec();
+        let mut patched = larql_vindex::PatchedVindex::new(fx.index);
+        patched.insert_call_patch(
+            CallPatchOp {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: Value::Null,
+                output_schema: Value::Null,
+                trigger: CallTrigger::default(),
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy::default(),
+                metadata: Value::Null,
+            },
+            first_hidden.iter().map(|v| v * 100.0).collect(),
+        );
+        let result = predict_with_call_patches_runner(
+            &fx.weights,
+            &fx.tokenizer,
+            &[0u32],
+            3,
+            &patched,
+            WalkFfnConfig::sparse(fx.weights.num_layers, 1),
+            StaticRunner { hidden },
+        );
+
+        assert!(result.predictions.len() <= 3);
+        assert_eq!(result.call_metrics.attempted, 1);
+        assert_eq!(result.call_metrics.fired, 1);
     }
 
     #[test]

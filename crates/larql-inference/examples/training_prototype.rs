@@ -24,11 +24,13 @@ use larql_inference::training::{
 
 fn residual_for_example(idx: usize, hidden: usize) -> Vec<f32> {
     // Deterministic pseudo-random residual seeded by index.
-    let seed = (idx as u64).wrapping_mul(6_364_136_223_846_793_005)
+    let seed = (idx as u64)
+        .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
     (0..hidden)
         .map(|i| {
-            let v = seed.wrapping_add(i as u64)
+            let v = seed
+                .wrapping_add(i as u64)
                 .wrapping_mul(2_862_933_555_777_941_757);
             let f = (v >> 32) as i32 as f32 / i32::MAX as f32;
             f
@@ -60,7 +62,12 @@ fn main() {
     let dataset = build_dataset(20, seed);
     let positives = dataset.iter().filter(|e| e.is_positive).count();
     let negatives = dataset.iter().filter(|e| !e.is_positive).count();
-    println!("Dataset: {} examples ({} positive, {} hard negative)", dataset.len(), positives, negatives);
+    println!(
+        "Dataset: {} examples ({} positive, {} hard negative)",
+        dataset.len(),
+        positives,
+        negatives
+    );
 
     let categories = [
         TaskCategory::ArithmeticNorm,
@@ -71,7 +78,10 @@ fn main() {
         TaskCategory::SymbolicFormat,
     ];
     for cat in &categories {
-        let n = dataset.iter().filter(|e| &e.category == cat && e.is_positive).count();
+        let n = dataset
+            .iter()
+            .filter(|e| &e.category == cat && e.is_positive)
+            .count();
         println!("  {:?}: {} positive examples", cat, n);
     }
     println!();
@@ -101,13 +111,19 @@ fn main() {
             let label = if ex.is_positive { 1.0 } else { 0.0 };
             // Pair each positive with the next negative.
             let paired_negative = if ex.is_positive {
-                dataset.iter().enumerate()
+                dataset
+                    .iter()
+                    .enumerate()
                     .find(|(j, e)| *j != i && !e.is_positive)
                     .map(|(j, _)| residual_for_example(j, hidden))
             } else {
                 None
             };
-            GateExample { residual, label, paired_negative }
+            GateExample {
+                residual,
+                label,
+                paired_negative,
+            }
         })
         .collect();
 
@@ -125,8 +141,12 @@ fn main() {
     for epoch in 1..=10 {
         let acc = calibrator.fit_epoch(&gate_examples);
         if epoch == 1 || epoch % 3 == 0 || epoch == 10 {
-            println!("  Epoch {epoch:2}: BCE={:.4}  total={:.4}  fire_rate={:.2}%",
-                acc.bce_mean(), acc.total_mean(), acc.fire_rate() * 100.0);
+            println!(
+                "  Epoch {epoch:2}: BCE={:.4}  total={:.4}  fire_rate={:.2}%",
+                acc.bce_mean(),
+                acc.total_mean(),
+                acc.fire_rate() * 100.0
+            );
         }
         last_loss = acc.total_mean();
     }
@@ -140,7 +160,9 @@ fn main() {
     // ────────────────────────────────────────────────────────────────────────
     println!("--- Phase 3: Decoder warmup ---");
 
-    let decoder_examples: Vec<DecoderWarmupExample> = dataset.iter().enumerate()
+    let decoder_examples: Vec<DecoderWarmupExample> = dataset
+        .iter()
+        .enumerate()
         .filter(|(_, e)| e.is_positive)
         .map(|(i, ex)| {
             // Extract target token index as a simple modular hash.
@@ -198,11 +220,13 @@ fn main() {
 
     // Simulate baseline vs patched predictions for accuracy.
     // Baseline: predict "X" (wrong for arithmetic); patched: predict the target.
-    let baseline_preds: Vec<(String, String)> = dataset.iter()
+    let baseline_preds: Vec<(String, String)> = dataset
+        .iter()
         .filter(|e| e.is_positive)
         .map(|e| ("X".to_string(), e.target_token.clone()))
         .collect();
-    let patched_preds: Vec<(String, String)> = dataset.iter()
+    let patched_preds: Vec<(String, String)> = dataset
+        .iter()
         .filter(|e| e.is_positive)
         .map(|e| {
             // Arithmetic and string tasks "fixed" by call patch.
@@ -219,7 +243,9 @@ fn main() {
     let (base_acc, patch_acc, _) = accuracy_improvement(&baseline_preds, &patched_preds);
 
     // Gate predictions using the calibrated gate.
-    let gate_preds: Vec<GatePrediction> = dataset.iter().enumerate()
+    let gate_preds: Vec<GatePrediction> = dataset
+        .iter()
+        .enumerate()
         .map(|(i, ex)| {
             let res = residual_for_example(i, hidden);
             GatePrediction {
@@ -236,13 +262,13 @@ fn main() {
         .map(|i| {
             let target = i % vocab;
             // Baseline: near-uniform log-probs.
-            let base_lp: Vec<f32> = (0..vocab).map(|j| {
-                if j == target { -1.0f32 } else { -2.5 }
-            }).collect();
+            let base_lp: Vec<f32> = (0..vocab)
+                .map(|j| if j == target { -1.0f32 } else { -2.5 })
+                .collect();
             // Patched: slightly sharper on the target (a small improvement).
-            let patch_lp: Vec<f32> = (0..vocab).map(|j| {
-                if j == target { -0.8f32 } else { -2.6 }
-            }).collect();
+            let patch_lp: Vec<f32> = (0..vocab)
+                .map(|j| if j == target { -0.8f32 } else { -2.6 })
+                .collect();
             (base_lp, patch_lp, target)
         })
         .collect();
@@ -253,7 +279,14 @@ fn main() {
     let two: Vec<(bool, bool)> = (0..20).map(|i| (i < 4, i < 2)).collect();
     let reach = reach_probe(&single, &two);
 
-    print_m8_report(dataset.len(), base_acc, patch_acc, &gate, &regression, &reach);
+    print_m8_report(
+        dataset.len(),
+        base_acc,
+        patch_acc,
+        &gate,
+        &regression,
+        &reach,
+    );
 
     // Exit criteria validation.
     assert!(
@@ -262,7 +295,8 @@ fn main() {
     );
     assert!(
         gate.f1 >= 0.0,
-        "gate F1 should be non-negative, got {}", gate.f1
+        "gate F1 should be non-negative, got {}",
+        gate.f1
     );
     assert!(
         !regression.regression_detected,

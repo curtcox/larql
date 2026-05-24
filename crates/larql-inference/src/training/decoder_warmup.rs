@@ -133,8 +133,7 @@ impl LinearDecoder {
         let mut grad_w = vec![0.0f32; self.w.len()];
         for h in 0..self.hidden_size {
             for m in 0..self.monty_dim {
-                grad_w[h * self.monty_dim + m] =
-                    grad_delta[h] * example.monty_output[m]
+                grad_w[h * self.monty_dim + m] = grad_delta[h] * example.monty_output[m]
                     + self.config.weight_decay * self.w[h * self.monty_dim + m];
             }
         }
@@ -145,7 +144,12 @@ impl LinearDecoder {
 
         // Clip gradients.
         if self.config.grad_clip > 0.0 {
-            let all_norms = grad_w.iter().chain(grad_b.iter()).map(|v| v * v).sum::<f32>().sqrt();
+            let all_norms = grad_w
+                .iter()
+                .chain(grad_b.iter())
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt();
             if all_norms > self.config.grad_clip {
                 let s = self.config.grad_clip / all_norms;
                 grad_w.iter_mut().for_each(|v| *v *= s);
@@ -327,6 +331,9 @@ mod tests {
         for _ in 0..200 {
             last_mse = surrogate.update_to_match(&residual, &real_delta);
         }
-        assert!(last_mse < 0.1, "surrogate MSE should be small after 200 steps, got {last_mse:.4}");
+        assert!(
+            last_mse < 0.1,
+            "surrogate MSE should be small after 200 steps, got {last_mse:.4}"
+        );
     }
 }
