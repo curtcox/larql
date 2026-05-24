@@ -33,6 +33,7 @@ use rayon::prelude::*;
 
 use super::helpers::hits_len_ge_intermediate;
 use super::WalkFfn;
+use crate::monty_call::{CallCandidate, CallContext};
 use crate::vindex::walk_config::FeatureSelector;
 
 impl<'a> WalkFfn<'a> {
@@ -267,8 +268,49 @@ impl<'a> WalkFfn<'a> {
                 continue;
             }
 
+            let mut margins = Vec::new();
+            if self.call_patches.is_some() {
+                margins.reserve(hits.len());
+                for i in 0..hits.len() {
+                    let next = hits.get(i + 1).map(|(_, s)| s.abs()).unwrap_or(0.0);
+                    margins.push(hits[i].1.abs() - next);
+                }
+            }
+
             // Serial per-feature loop — the correctness baseline.
-            for (feat, gate_score) in hits {
+            for (rank_idx, (feat, gate_score)) in hits.into_iter().enumerate() {
+                if let Some(call) = self
+                    .call_patches
+                    .and_then(|patches| patches.call_patch(layer, feat))
+                {
+                    if let Some(runtime) = self.call_runtime {
+                        let ctx = CallContext {
+                            layer,
+                            position: s,
+                            residual: x_slice,
+                            token_ids: &[],
+                            token_text: None,
+                        };
+                        if let Ok(Some(call_output)) = runtime.execute_call(
+                            call,
+                            CallCandidate {
+                                rank: rank_idx + 1,
+                                score: gate_score,
+                                margin: margins.get(rank_idx).copied(),
+                            },
+                            &ctx,
+                            hidden,
+                        ) {
+                            if let Some(delta) = call_output.residual_delta {
+                                if delta.len() == hidden {
+                                    out_row += &ndarray::ArrayView1::from(delta.as_slice());
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 let act = if is_gated {
                     let up_ov = if layer_has_overrides {
                         self.index.up_override(layer, feat)
@@ -346,11 +388,15 @@ impl<'a> WalkFfn<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::monty_call::{CallError, CallProgramRunner, MontyCallRuntime};
     use crate::test_utils::{
         make_test_q4k_vindex, make_test_q4k_weights, make_test_vindex, make_test_weights,
     };
     use crate::vindex::{WalkFfn, WalkFfnConfig};
+    use larql_vindex::{CallPatchOp, CallResourceLimits, CallSafetyPolicy, CallTrigger};
     use ndarray::Array2;
+    use serde_json::{json, Value};
+    use std::cell::RefCell;
 
     fn x(seq: usize, hidden: usize) -> Array2<f32> {
         Array2::from_shape_vec(
@@ -443,6 +489,54 @@ mod tests {
             .expect("starcoder2 + feature-major fixture should produce output");
         assert_eq!(out.0.shape(), &[1, weights.hidden_size]);
         assert!(out.0.iter().all(|v| v.is_finite()));
+    }
+
+    struct StaticRunner {
+        hidden: usize,
+    }
+
+    impl CallProgramRunner for StaticRunner {
+        fn run(&mut self, _call: &CallPatchOp, _input: Value) -> Result<Value, CallError> {
+            Ok(json!({"residual_delta": vec![1.0f32; self.hidden]}))
+        }
+    }
+
+    #[test]
+    fn walk_ffn_sparse_applies_selected_call_patch_delta() {
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        patched.insert_call_patch(
+            CallPatchOp {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: Value::Null,
+                output_schema: Value::Null,
+                trigger: CallTrigger::default(),
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy::default(),
+                metadata: Value::Null,
+            },
+            vec![100.0; hidden],
+        );
+        let runtime = RefCell::new(MontyCallRuntime::new(StaticRunner { hidden }));
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 1);
+        let ffn = WalkFfn::from_config(&weights, &patched, cfg)
+            .with_call_patches(&patched)
+            .with_call_runtime(&runtime);
+
+        let (out, _activation) = ffn
+            .walk_ffn_sparse(0, &Array2::from_elem((1, hidden), 1.0))
+            .expect("call-patched sparse walk should produce output");
+
+        assert_eq!(out.row(0).to_vec(), vec![1.0; hidden]);
+        assert_eq!(runtime.borrow().metrics().fired, 1);
     }
 
     /// Sparse walk in full-K mode against the Q4K fixture (no native

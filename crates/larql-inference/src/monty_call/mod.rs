@@ -70,6 +70,26 @@ pub trait CallProgramRunner {
     fn run(&mut self, call: &CallPatchOp, input: Value) -> Result<Value, CallError>;
 }
 
+pub trait CallPatchLookup {
+    fn call_patch(&self, layer: usize, feature: usize) -> Option<&CallPatchOp>;
+}
+
+impl CallPatchLookup for larql_vindex::PatchedVindex {
+    fn call_patch(&self, layer: usize, feature: usize) -> Option<&CallPatchOp> {
+        self.call_patch(layer, feature)
+    }
+}
+
+pub trait WalkCallRuntime {
+    fn execute_call(
+        &self,
+        call: &CallPatchOp,
+        candidate: CallCandidate,
+        ctx: &CallContext<'_>,
+        hidden_size: usize,
+    ) -> Result<Option<CallOutput>, CallError>;
+}
+
 #[derive(Debug, Default)]
 pub struct MontyCallRuntime<R> {
     runner: R,
@@ -126,6 +146,19 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
         apply_safety(&mut output, &call.safety);
         self.metrics.fired += 1;
         Ok(Some(output))
+    }
+}
+
+impl<R: CallProgramRunner> WalkCallRuntime for std::cell::RefCell<MontyCallRuntime<R>> {
+    fn execute_call(
+        &self,
+        call: &CallPatchOp,
+        candidate: CallCandidate,
+        ctx: &CallContext<'_>,
+        hidden_size: usize,
+    ) -> Result<Option<CallOutput>, CallError> {
+        self.borrow_mut()
+            .execute_call(call, candidate, ctx, hidden_size)
     }
 }
 

@@ -93,9 +93,13 @@ Implemented:
 - Inference-side trigger evaluation, input encoding, output decoding,
   residual norm clamping, sparse logit-bias decoding, and an injectable
   `MontyCallRuntime<R: CallProgramRunner>` lifecycle.
+- Opt-in sparse `WalkFfn` wiring for selected call patches. Call features are
+  looked up after gate selection, executed through the installed runtime, and
+  skipped as static FFN rows.
 
 Not implemented yet:
 
 - Concrete Monty VM execution inside `larql-inference`.
 - Input/output codecs beyond persisted schema metadata.
+- Dense, Metal, full-mmap, and batched prefill call execution paths.
 - Inline `ATTACH CALL ... INPUT ... OUTPUT ... TRIGGER ...` grammar.

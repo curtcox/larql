@@ -139,8 +139,10 @@ The current implementation stores and loads call metadata, exposes it through
 runtime behavior. `larql-inference::monty_call` provides the deterministic
 runtime boundary: trigger checks, input encoding, output decoding, sparse logit
 bias decoding, residual clamps, metrics, and an injectable program-runner trait.
-Actual Monty VM execution is intentionally not part of the BLAS or Metal fast
-path yet.
+The sparse CPU `WalkFfn` path can opt into this runtime by installing both a
+call-patch lookup and a runtime; selected call features are handled as runtime
+calls and are not treated as static FFN rows. Actual Monty VM execution is
+intentionally not part of the BLAS or Metal fast path yet.
 
 ### Memory
 

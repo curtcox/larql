@@ -43,6 +43,7 @@ use ndarray::Array2;
 use crate::ffn::sparse_compute::sparse_ffn_forward;
 use crate::ffn::FfnBackend;
 use crate::model::ModelWeights;
+use crate::monty_call::{CallPatchLookup, WalkCallRuntime};
 use crate::vindex::l1_cache::FfnL1Cache;
 use crate::vindex::walk_config::WalkFfnConfig;
 use larql_compute::prelude::*;
@@ -108,6 +109,12 @@ pub struct WalkFfn<'a> {
     /// Lazy cache of per-feature `‖up_row‖` per layer. Built on first
     /// use when the selector is `GateXUpDownNorm`.
     pub(super) up_norms_cache: std::cell::RefCell<Vec<Option<std::sync::Arc<Vec<f32>>>>>,
+    /// Optional runtime call-patch lookup. Kept separate from
+    /// `GateIndex` so the pure KNN/FFN trait surface stays unchanged.
+    pub(super) call_patches: Option<&'a dyn CallPatchLookup>,
+    /// Optional executor for fired call patches. When absent, selected
+    /// call patches are skipped rather than treated as static FFN rows.
+    pub(super) call_runtime: Option<&'a dyn WalkCallRuntime>,
 }
 
 impl<'a> WalkFfn<'a> {
@@ -129,6 +136,8 @@ impl<'a> WalkFfn<'a> {
             phase_timings: None,
             down_norms_cache: std::cell::RefCell::new(vec![None; num_layers]),
             up_norms_cache: std::cell::RefCell::new(vec![None; num_layers]),
+            call_patches: None,
+            call_runtime: None,
         }
     }
 
@@ -141,6 +150,16 @@ impl<'a> WalkFfn<'a> {
 
     pub fn with_backend(mut self, backend: &'a dyn ComputeBackend) -> Self {
         self.backend = Some(backend);
+        self
+    }
+
+    pub fn with_call_patches(mut self, patches: &'a dyn CallPatchLookup) -> Self {
+        self.call_patches = Some(patches);
+        self
+    }
+
+    pub fn with_call_runtime(mut self, runtime: &'a dyn WalkCallRuntime) -> Self {
+        self.call_runtime = Some(runtime);
         self
     }
 
