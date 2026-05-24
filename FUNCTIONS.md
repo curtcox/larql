@@ -5,11 +5,13 @@ Current status snapshot
 This document is now split into two readings:
 
 * **Already done**: the repository has the schema, patch overlay, docs, LQL
-  file-backed attach flow, and an opt-in inference-side execution seam for
-  call patches.
-* **Remaining**: the actual Monty VM runner, broader inference-path coverage,
-  production safety hardening, public metrics/trace surfacing, benchmarks, and
-  the training pipeline.
+  file-backed attach flow, an opt-in inference-side execution seam for
+  call patches, a public inference entry point (`predict_with_call_patches` /
+  `predict_with_call_patches_runner`) that surfaces call metrics and per-event
+  trace events, and M5 safety hardening.
+* **Remaining**: broader inference-path coverage beyond the sparse CPU
+  `WalkFfn` path, generation-loop integration, production safety hardening,
+  benchmarks, and the training pipeline.
 
 Already implemented in-tree
 
@@ -82,9 +84,15 @@ Still remaining
 
 Recommended next milestone
 
-The next highest-leverage step is to thread call-patch lookup/runtime hooks
-through a public inference entry point so callers can observe call metrics and
-trace events without constructing `WalkFfn` directly.
+Public metrics/trace surfacing is now complete:
+`predict_with_call_patches_runner` accepts `PredictCallPatchesOptions` and
+returns `PredictResultWithCallMetrics` containing both `call_metrics` and
+`trace_events`. Trace collection is opt-in via `PredictCallPatchesOptions::with_trace()`.
+
+The next highest-leverage step is to thread call-patch execution into the
+multi-token generation loop so `generate` / `generate_streaming` can run with
+an active call-patch `PatchedVindex` and report aggregate metrics after the
+sequence completes.
 
 Reading note
 
@@ -169,11 +177,26 @@ M5 safety hardening — complete:
   `encoder_raw_vs_topk/{raw_f32,topk_basis}` at multiple hidden sizes,
   `monty_call_runtime/{in_process_runner,skipped_trigger}`.
 
+Public observability entry point — complete:
+
+* `predict_with_call_patches_runner` now accepts
+  `PredictCallPatchesOptions` (builder: `.with_trace()`).
+* `PredictResultWithCallMetrics` gained `trace_events: Vec<CallTraceEvent>`.
+* Trace collection is disabled by default (zero overhead on the common path);
+  enable per-call with `PredictCallPatchesOptions::with_trace()`.
+* `PredictCallPatchesOptions` and `PredictResultWithCallMetrics` are exported
+  at `larql_inference::` root and at `larql_inference::forward::`.
+* Tests: `predict_with_call_patches_runner_exposes_metrics` (no trace),
+  `predict_with_call_patches_runner_collects_trace_when_enabled` (Fired event).
+
 Still incomplete:
 
 * Dense/static FFN paths, Metal/GPU paths, full mmap/kquant paths, and batched
   prefill/generation loop integration — call patches only execute on the
   sparse CPU `WalkFfn` path today.
+* No `generate_with_call_patches` entry point yet — multi-token generation
+  requires manually constructing `WalkFfn` and threading it through a
+  `LayerGraph`; aggregate metrics and trace events are not collected.
 
 ⸻
 

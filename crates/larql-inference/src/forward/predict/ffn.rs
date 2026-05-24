@@ -8,15 +8,21 @@ use super::types::{LayerAttentionCapture, LayerMode, PredictResult, PredictResul
 use crate::attention::SharedKV;
 use crate::ffn::{FfnBackend, LayerFfnRouter};
 use crate::model::ModelWeights;
-use crate::monty_call::{CallProgramRunner, MontyCallMetrics, MontyCallRuntime, MontyVmRunner};
+use crate::monty_call::{
+    CallProgramRunner, CallTraceEvent, MontyCallMetrics, MontyCallRuntime, MontyVmRunner,
+};
 use crate::vindex::{WalkFfn, WalkFfnConfig};
 use std::cell::RefCell;
 
-/// Prediction result plus runtime call-patch counters.
+/// Prediction result plus runtime call-patch counters and per-event trace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PredictResultWithCallMetrics {
     pub predictions: Vec<(String, f64)>,
     pub call_metrics: MontyCallMetrics,
+    /// Per-event trace. Empty unless the call was made via
+    /// [`predict_with_call_patches_runner`] with trace collection enabled via
+    /// [`PredictCallPatchesOptions::with_trace`].
+    pub trace_events: Vec<CallTraceEvent>,
 }
 
 /// Run a full forward pass with a custom FFN backend for all layers.
@@ -61,6 +67,20 @@ pub fn predict_with_ffn(
     logits_to_predictions(weights, &h, tokenizer, top_k, 1.0)
 }
 
+/// Options for [`predict_with_call_patches`] / [`predict_with_call_patches_runner`].
+#[derive(Debug, Clone, Default)]
+pub struct PredictCallPatchesOptions {
+    /// Collect per-event trace. Populated in [`PredictResultWithCallMetrics::trace_events`].
+    pub trace: bool,
+}
+
+impl PredictCallPatchesOptions {
+    pub fn with_trace(mut self) -> Self {
+        self.trace = true;
+        self
+    }
+}
+
 /// Run a vindex-backed forward pass with runtime call patches enabled.
 ///
 /// This is the public inference entry point for callers that have a
@@ -82,6 +102,7 @@ pub fn predict_with_call_patches(
         patched,
         config,
         MontyVmRunner::new(),
+        PredictCallPatchesOptions::default(),
     )
 }
 
@@ -96,17 +117,26 @@ pub fn predict_with_call_patches_runner<R: CallProgramRunner>(
     patched: &larql_vindex::PatchedVindex,
     config: WalkFfnConfig,
     runner: R,
+    opts: PredictCallPatchesOptions,
 ) -> PredictResultWithCallMetrics {
-    let runtime = RefCell::new(MontyCallRuntime::new(runner));
+    let base_runtime = MontyCallRuntime::new(runner);
+    let base_runtime = if opts.trace {
+        base_runtime.with_trace_events()
+    } else {
+        base_runtime
+    };
+    let runtime = RefCell::new(base_runtime);
     let ffn = WalkFfn::from_config(weights, patched, config)
         .with_call_patches(patched)
         .with_call_runtime(&runtime);
     let result = predict_with_ffn(weights, tokenizer, token_ids, top_k, &ffn);
     drop(ffn);
     let call_metrics = runtime.borrow().metrics();
+    let trace_events = runtime.borrow_mut().take_trace_events();
     PredictResultWithCallMetrics {
         predictions: result.predictions,
         call_metrics,
+        trace_events,
     }
 }
 
@@ -298,11 +328,57 @@ mod tests {
             &patched,
             WalkFfnConfig::sparse(fx.weights.num_layers, 1),
             StaticRunner { hidden },
+            PredictCallPatchesOptions::default(),
         );
 
         assert!(result.predictions.len() <= 3);
         assert_eq!(result.call_metrics.attempted, 1);
         assert_eq!(result.call_metrics.fired, 1);
+        assert!(result.trace_events.is_empty(), "trace disabled by default");
+    }
+
+    #[test]
+    fn predict_with_call_patches_runner_collects_trace_when_enabled() {
+        use crate::monty_call::CallOutcome;
+        let mut fx = TestFixtures::build();
+        attach_feature_major_f32_to_test_vindex(&fx.weights, &mut fx.index);
+        let hidden = fx.weights.hidden_size;
+        let first_hidden = embed_tokens(&fx.weights, &[0u32]).row(0).to_vec();
+        let mut patched = larql_vindex::PatchedVindex::new(fx.index);
+        patched.insert_call_patch(
+            CallPatchOp {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: Value::Null,
+                output_schema: Value::Null,
+                trigger: CallTrigger::default(),
+                limits: larql_vindex::CallResourceLimits::default(),
+                safety: larql_vindex::CallSafetyPolicy::default(),
+                metadata: Value::Null,
+            },
+            first_hidden.iter().map(|v| v * 100.0).collect(),
+        );
+        let result = predict_with_call_patches_runner(
+            &fx.weights,
+            &fx.tokenizer,
+            &[0u32],
+            3,
+            &patched,
+            WalkFfnConfig::sparse(fx.weights.num_layers, 1),
+            StaticRunner { hidden },
+            PredictCallPatchesOptions::default().with_trace(),
+        );
+
+        assert_eq!(result.call_metrics.fired, 1);
+        assert_eq!(result.trace_events.len(), 1, "one fired trace event expected");
+        assert!(
+            matches!(result.trace_events[0].outcome, CallOutcome::Fired),
+            "event should be Fired"
+        );
+        assert_eq!(result.trace_events[0].layer, 0);
     }
 
     #[test]
