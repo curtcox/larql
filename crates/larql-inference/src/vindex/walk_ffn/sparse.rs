@@ -290,7 +290,7 @@ impl<'a> WalkFfn<'a> {
                     if let Some(runtime) = self.call_runtime {
                         let ctx = CallContext {
                             layer,
-                            position: s,
+                            position: self.call_position_base.get() + s,
                             residual: x_slice,
                             token_ids: &[],
                             token_text: None,

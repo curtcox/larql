@@ -12,10 +12,9 @@ This document is now split into two readings:
   and dense-path call patch wiring (full_mmap, interleaved, kquant_native,
   kquant_dequant, exact, and weights_fallback paths now support call patches
   via the `apply_call_patches_dense` post-processing step).
-* **Remaining**: Metal/GPU path wiring, full mmap/kquant paths where
-  applicable (already done for CPU paths), batched prefill/generation loop
-  integration, production safety hardening, benchmarks, and the training
-  pipeline.
+* **Remaining**: Metal/GPU path wiring, batched prefill beyond the KV-cached
+  CPU generation loop, production safety hardening, benchmarks, and the
+  training pipeline.
 
 Already implemented in-tree
 
@@ -72,11 +71,9 @@ Already implemented in-tree
 
 Still remaining
 
-* Extend execution beyond the sparse CPU `WalkFfn` path:
-    * dense/static FFN paths
+* Extend execution beyond CPU `WalkFfn` paths:
     * Metal/GPU paths
-    * full mmap/kquant paths where applicable
-    * batched prefill and generation loop integration
+    * batched prefill beyond the KV-cached generation loop
 * Expand inline LQL beyond the current file-backed/gate-code vertical slice if
   richer `INPUT (...)`, `OUTPUT (...)`, and policy grammar proves necessary.
 * Build the codec roadmap beyond the current raw residual / top-k basis /
@@ -100,9 +97,8 @@ Multi-token generation with call patches is now implemented via
 state once at the start, and return `GenerateResultWithCallMetrics` with
 aggregate `call_metrics` and optional per-event `trace_events`.
 
-The next highest-leverage step is to extend call-patch execution beyond the
-sparse CPU `WalkFfn` path: dense/static FFN paths, Metal/GPU paths, and the
-KV-cached decode loop.
+The next highest-leverage step is Metal/GPU path wiring for call patches and
+batched prefill integration beyond the KV-cached CPU generation loop.
 
 Reading note
 
@@ -217,11 +213,22 @@ Dense CPU path wiring — complete:
   `apply_call_patches_dense_no_op_without_runtime`,
   `apply_call_patches_dense_respects_score_threshold`.
 
+KV-cached CPU generation — complete:
+
+* `generate_with_call_patches_runner` now uses a production KV-cached loop
+  (prefill once via `run_layer_with_ffn`, then single-token decode steps)
+  instead of re-running the full prompt each token.
+* `WalkFfn::set_call_position_base` threads absolute token indices into call
+  contexts so cooldown and per-sequence budgets work across decode steps.
+* Dense and sparse `WalkFfn` paths both fire call patches on prefill and decode.
+
 Still incomplete:
 
 * Metal/GPU paths — deferred per the CPU-first policy from the plan.
-* KV-cached decode loop — not yet wired.
-* Batched prefill integration beyond the current O(N²) loop.
+* Batched prefill integration beyond the KV-cached single-stream loop.
+* Cross-layer KV sharing on the call-patch generation path (same constraint as
+  `supports_cached_decode` — architectures with `kv_shared_source_layer` need
+  a dedicated path).
 
 ⸻
 

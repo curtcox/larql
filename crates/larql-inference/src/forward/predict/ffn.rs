@@ -1,11 +1,13 @@
 //! FFN-backend forward passes (custom backend, router, strategy).
 
-use super::super::embed::embed_tokens;
-use super::super::layer::{run_attention, run_layer_with_capture, run_layer_with_ffn};
-use super::super::ple::precompute_per_layer_inputs;
+use super::super::embed::{embed_tokens, embed_tokens_pub};
+use super::super::layer::{
+    apply_layer_scalar, run_attention, run_ffn, run_layer_with_capture, run_layer_with_ffn,
+};
+use super::super::ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
 use super::dense::logits_to_predictions;
 use super::types::{LayerAttentionCapture, LayerMode, PredictResult, PredictResultWithAttention};
-use crate::attention::SharedKV;
+use crate::attention::{run_attention_block_decode_step_backend, SharedKV};
 use crate::ffn::{FfnBackend, LayerFfnRouter};
 use crate::layer_graph::generate::{EosConfig, GenerateError};
 use crate::model::ModelWeights;
@@ -13,7 +15,9 @@ use crate::monty_call::{
     CallProgramRunner, CallTraceEvent, MontyCallMetrics, MontyCallRuntime, MontyVmRunner,
 };
 use crate::vindex::{WalkFfn, WalkFfnConfig};
+use ndarray::Array2;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Prediction result plus runtime call-patch counters and per-event trace.
 #[derive(Debug, Clone, PartialEq)]
@@ -198,12 +202,13 @@ pub fn generate_with_call_patches(
 /// caller-supplied runner.
 ///
 /// Threads a `PatchedVindex` and `MontyCallRuntime` through `WalkFfn` at every
-/// decode step, resets per-sequence state once at the start, then accumulates
-/// call-patch metrics and optional trace events across the full sequence.
+/// prefill and decode step, resets per-sequence state once at the start, then
+/// accumulates call-patch metrics and optional trace events across the full
+/// sequence.
 ///
-/// This uses an O(N²)-in-sequence-length loop via the sparse CPU `WalkFfn`
-/// path. Call patches only execute on that path today — dense, Metal, and
-/// KV-cached paths are not yet wired.
+/// Uses the production KV-cached CPU loop (prefill once, then single-token
+/// decode steps) so call patches fire on both sparse and dense `WalkFfn`
+/// paths without re-running the full prompt each token.
 pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
@@ -225,6 +230,16 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
             error: None,
         };
     }
+    if token_ids.is_empty() {
+        return GenerateResultWithCallMetrics {
+            tokens: Vec::new(),
+            prefill_ms: 0.0,
+            decode_ms: Vec::new(),
+            call_metrics: MontyCallMetrics::default(),
+            trace_events: Vec::new(),
+            error: None,
+        };
+    }
 
     let base_runtime = MontyCallRuntime::new(runner);
     let base_runtime = if opts.trace {
@@ -235,25 +250,39 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
     let runtime = RefCell::new(base_runtime);
     runtime.borrow_mut().reset_sequence_state();
 
-    let mut current_ids = token_ids.to_vec();
+    let ffn = WalkFfn::from_config(weights, patched, config)
+        .with_call_patches(patched)
+        .with_call_runtime(&runtime);
+
     let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
     let mut decode_ms: Vec<f64> = Vec::with_capacity(max_tokens);
 
-    // First step treated as prefill.
     let prefill_start = std::time::Instant::now();
-    let first = {
-        let ffn = WalkFfn::from_config(weights, patched, config.clone())
-            .with_call_patches(patched)
-            .with_call_runtime(&runtime);
-        predict_with_ffn(weights, tokenizer, &current_ids, 1, &ffn)
-    };
+    let (last_hidden, mut kv_cache, mut next_position) =
+        match kv_prefill_with_call_ffn(weights, token_ids, &ffn) {
+            Some(t) => t,
+            None => {
+                let call_metrics = runtime.borrow().metrics();
+                let trace_events = runtime.borrow_mut().take_trace_events();
+                return GenerateResultWithCallMetrics {
+                    tokens,
+                    prefill_ms: 0.0,
+                    decode_ms,
+                    call_metrics,
+                    trace_events,
+                    error: Some(GenerateError::empty_output(
+                        "generate_with_call_patches: prefill failed",
+                    )),
+                };
+            }
+        };
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
+    let first = logits_to_predictions(weights, &last_hidden, tokenizer, 1, 1.0);
     let first_stop = match (first.token_ids.first(), first.predictions.first()) {
         (Some(&id), Some(pred)) => {
             let stop = eos.is_eos_with_tokenizer(id, &pred.0, tokenizer);
             tokens.push((pred.0.clone(), 1.0));
-            current_ids.push(id);
             stop
         }
         _ => {
@@ -271,7 +300,7 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
             };
         }
     };
-    if first_stop {
+    if first_stop || max_tokens == 1 {
         let call_metrics = runtime.borrow().metrics();
         let trace_events = runtime.borrow_mut().take_trace_events();
         return GenerateResultWithCallMetrics {
@@ -284,23 +313,30 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
         };
     }
 
-    // Decode loop — O(N²) in growing sequence length.
+    let mut current_id = first.token_ids[0];
     for _step in 1..max_tokens {
         let step_start = std::time::Instant::now();
-        let result = {
-            let ffn = WalkFfn::from_config(weights, patched, config.clone())
-                .with_call_patches(patched)
-                .with_call_runtime(&runtime);
-            predict_with_ffn(weights, tokenizer, &current_ids, 1, &ffn)
+        ffn.set_call_position_base(next_position);
+        let h_step = match kv_decode_step_with_call_ffn(
+            weights,
+            &ffn,
+            &mut kv_cache,
+            current_id,
+            next_position,
+        ) {
+            Some(h) => h,
+            None => break,
         };
+        next_position += 1;
         let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
         decode_ms.push(step_ms);
 
+        let result = logits_to_predictions(weights, &h_step, tokenizer, 1, 1.0);
         match (result.token_ids.first(), result.predictions.first()) {
             (Some(&id), Some(pred)) => {
                 let stop = eos.is_eos_with_tokenizer(id, &pred.0, tokenizer);
                 tokens.push((pred.0.clone(), 1.0));
-                current_ids.push(id);
+                current_id = id;
                 if stop {
                     break;
                 }
@@ -319,6 +355,85 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
         trace_events,
         error: None,
     }
+}
+
+/// KV-cache prefill for call-patch generation. Returns the last prompt hidden
+/// state, per-layer K/V, and the next absolute token position.
+fn kv_prefill_with_call_ffn(
+    weights: &ModelWeights,
+    prompt_ids: &[u32],
+    ffn: &WalkFfn<'_>,
+) -> Option<(Array2<f32>, HashMap<usize, SharedKV>, usize)> {
+    ffn.set_call_position_base(0);
+    let num_layers = weights.num_layers;
+    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+    let mut h = embed_tokens_pub(weights, prompt_ids);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, prompt_ids);
+    for layer in 0..num_layers {
+        let shared_kv = weights
+            .arch
+            .kv_shared_source_layer(layer)
+            .and_then(|src| kv_cache.get(&src));
+        let (h_new, _, kv_out) = run_layer_with_ffn(
+            weights,
+            &h,
+            layer,
+            ffn,
+            false,
+            ple_inputs.get(layer),
+            shared_kv,
+        )?;
+        h = h_new;
+        if let Some(kv) = kv_out {
+            kv_cache.insert(layer, kv);
+        }
+    }
+    let next_position = prompt_ids.len();
+    Some((last_row_as_2d(&h), kv_cache, next_position))
+}
+
+/// Single-token KV decode step for call-patch generation.
+///
+/// Mirrors `larql_kv::generation::kv_decode_step_run` but lives in inference
+/// to avoid a circular dependency. Architectures with cross-layer KV sharing
+/// are not supported on this path (same constraint as `supports_cached_decode`).
+fn kv_decode_step_with_call_ffn(
+    weights: &ModelWeights,
+    ffn: &WalkFfn<'_>,
+    kv_cache: &mut HashMap<usize, SharedKV>,
+    token_id: u32,
+    abs_position: usize,
+) -> Option<Array2<f32>> {
+    let num_layers = weights.num_layers;
+    let h_new = embed_tokens_pub(weights, &[token_id]);
+    let ple_inputs = precompute_per_layer_inputs(weights, &h_new, &[token_id]);
+    let mut h_step = h_new;
+    for layer in 0..num_layers {
+        let prior_kv = kv_cache.get(&layer);
+        let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
+            weights,
+            &h_step,
+            layer,
+            prior_kv,
+            abs_position,
+            ffn.backend,
+        )?;
+        kv_cache.insert(layer, new_kv);
+        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let mut h_out =
+            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
+        apply_layer_scalar(weights, &mut h_out, layer);
+        h_step = h_out;
+    }
+    Some(h_step)
+}
+
+fn last_row_as_2d(h: &Array2<f32>) -> Array2<f32> {
+    let seq_len = h.shape()[0];
+    let hidden = h.shape()[1];
+    let mut out = Array2::<f32>::zeros((1, hidden));
+    out.row_mut(0).assign(&h.row(seq_len - 1));
+    out
 }
 
 /// Run a full forward pass with a custom FFN backend, capturing attention weights

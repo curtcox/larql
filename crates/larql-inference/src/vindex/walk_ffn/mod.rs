@@ -115,6 +115,10 @@ pub struct WalkFfn<'a> {
     /// Optional executor for fired call patches. When absent, selected
     /// call patches are skipped rather than treated as static FFN rows.
     pub(super) call_runtime: Option<&'a dyn WalkCallRuntime>,
+    /// Base token index added to per-forward position `s` in call-patch
+    /// contexts. Set before KV-cached decode steps so cooldown / sequence
+    /// budgets use absolute positions rather than always 0.
+    pub(super) call_position_base: std::cell::Cell<usize>,
 }
 
 impl<'a> WalkFfn<'a> {
@@ -138,7 +142,17 @@ impl<'a> WalkFfn<'a> {
             up_norms_cache: std::cell::RefCell::new(vec![None; num_layers]),
             call_patches: None,
             call_runtime: None,
+            call_position_base: std::cell::Cell::new(0),
         }
+    }
+
+    /// Set the absolute token index base for call-patch position reporting.
+    ///
+    /// During a single-token KV decode step, the forward pass has `seq_len == 1`
+    /// so the in-batch position is always 0; adding this base yields the true
+    /// sequence index for cooldown and per-sequence budgets.
+    pub fn set_call_position_base(&self, base: usize) {
+        self.call_position_base.set(base);
     }
 
     /// Attach a phase-timing sink. Records cache_fetch / scan / reduce
@@ -381,7 +395,7 @@ impl<'a> WalkFfn<'a> {
 
                 let ctx = crate::monty_call::CallContext {
                     layer,
-                    position: s,
+                    position: self.call_position_base.get() + s,
                     residual: x_slice,
                     token_ids: &[],
                     token_text: None,
