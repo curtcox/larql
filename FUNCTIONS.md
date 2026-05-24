@@ -89,10 +89,16 @@ Public metrics/trace surfacing is now complete:
 returns `PredictResultWithCallMetrics` containing both `call_metrics` and
 `trace_events`. Trace collection is opt-in via `PredictCallPatchesOptions::with_trace()`.
 
-The next highest-leverage step is to thread call-patch execution into the
-multi-token generation loop so `generate` / `generate_streaming` can run with
-an active call-patch `PatchedVindex` and report aggregate metrics after the
-sequence completes.
+Multi-token generation with call patches is now implemented via
+`generate_with_call_patches` / `generate_with_call_patches_runner` in
+`larql-inference/src/forward/predict/ffn.rs`. These thread a shared
+`MontyCallRuntime` through `WalkFfn` at every decode step, reset per-sequence
+state once at the start, and return `GenerateResultWithCallMetrics` with
+aggregate `call_metrics` and optional per-event `trace_events`.
+
+The next highest-leverage step is to extend call-patch execution beyond the
+sparse CPU `WalkFfn` path: dense/static FFN paths, Metal/GPU paths, and the
+KV-cached decode loop.
 
 Reading note
 
@@ -194,9 +200,6 @@ Still incomplete:
 * Dense/static FFN paths, Metal/GPU paths, full mmap/kquant paths, and batched
   prefill/generation loop integration — call patches only execute on the
   sparse CPU `WalkFfn` path today.
-* No `generate_with_call_patches` entry point yet — multi-token generation
-  requires manually constructing `WalkFfn` and threading it through a
-  `LayerGraph`; aggregate metrics and trace events are not collected.
 
 ⸻
 

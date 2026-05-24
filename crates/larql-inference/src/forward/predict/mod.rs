@@ -30,8 +30,9 @@ pub use dense::{
 };
 
 pub use ffn::{
-    predict_with_call_patches, predict_with_call_patches_runner, predict_with_ffn,
-    predict_with_ffn_attention, predict_with_router, predict_with_strategy,
+    generate_with_call_patches, generate_with_call_patches_runner, predict_with_call_patches,
+    predict_with_call_patches_runner, predict_with_ffn, predict_with_ffn_attention,
+    predict_with_router, predict_with_strategy, GenerateResultWithCallMetrics,
     PredictCallPatchesOptions, PredictResultWithCallMetrics,
 };
 

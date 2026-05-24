@@ -71,12 +71,13 @@ pub use patching::{
     DonorState, PatchHook,
 };
 pub use predict::{
-    forward_from_layer, forward_raw_logits, forward_raw_logits_with_prefix, hidden_to_raw_logits,
+    forward_from_layer, forward_raw_logits, forward_raw_logits_with_prefix,
+    generate_with_call_patches, generate_with_call_patches_runner, hidden_to_raw_logits,
     logit_lens_top1, logits_to_predictions_pub, predict, predict_from_hidden,
     predict_from_hidden_with_ffn, predict_with_call_patches, predict_with_call_patches_runner,
     predict_with_ffn, predict_with_ffn_attention, predict_with_ffn_trace, predict_with_router,
-    predict_with_strategy, predict_with_temperature, PredictCallPatchesOptions,
-    PredictResultWithCallMetrics, RawForward,
+    predict_with_strategy, predict_with_temperature, GenerateResultWithCallMetrics,
+    PredictCallPatchesOptions, PredictResultWithCallMetrics, RawForward,
 };
 pub use target_delta::{TargetDelta, TargetDeltaOpts};
 pub use trace::{

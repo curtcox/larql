@@ -7,6 +7,7 @@ use super::dense::logits_to_predictions;
 use super::types::{LayerAttentionCapture, LayerMode, PredictResult, PredictResultWithAttention};
 use crate::attention::SharedKV;
 use crate::ffn::{FfnBackend, LayerFfnRouter};
+use crate::layer_graph::generate::{EosConfig, GenerateError};
 use crate::model::ModelWeights;
 use crate::monty_call::{
     CallProgramRunner, CallTraceEvent, MontyCallMetrics, MontyCallRuntime, MontyVmRunner,
@@ -137,6 +138,186 @@ pub fn predict_with_call_patches_runner<R: CallProgramRunner>(
         predictions: result.predictions,
         call_metrics,
         trace_events,
+    }
+}
+
+/// Result of multi-token generation with call-patch observability.
+#[derive(Debug)]
+pub struct GenerateResultWithCallMetrics {
+    pub tokens: Vec<(String, f64)>,
+    pub prefill_ms: f64,
+    pub decode_ms: Vec<f64>,
+    pub call_metrics: MontyCallMetrics,
+    /// Per-event trace. Empty unless trace collection was enabled via
+    /// [`PredictCallPatchesOptions::with_trace`].
+    pub trace_events: Vec<CallTraceEvent>,
+    pub error: Option<GenerateError>,
+}
+
+impl GenerateResultWithCallMetrics {
+    pub fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    pub fn text(&self) -> String {
+        self.tokens
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+/// Run multi-token generation with runtime call patches enabled.
+///
+/// Convenience wrapper over [`generate_with_call_patches_runner`] using the
+/// default [`MontyVmRunner`] and no trace collection.
+pub fn generate_with_call_patches(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    patched: &larql_vindex::PatchedVindex,
+    config: WalkFfnConfig,
+    eos: &EosConfig,
+) -> GenerateResultWithCallMetrics {
+    generate_with_call_patches_runner(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        patched,
+        config,
+        MontyVmRunner::new(),
+        PredictCallPatchesOptions::default(),
+        eos,
+    )
+}
+
+/// Run multi-token generation with runtime call patches enabled and a
+/// caller-supplied runner.
+///
+/// Threads a `PatchedVindex` and `MontyCallRuntime` through `WalkFfn` at every
+/// decode step, resets per-sequence state once at the start, then accumulates
+/// call-patch metrics and optional trace events across the full sequence.
+///
+/// This uses an O(N²)-in-sequence-length loop via the sparse CPU `WalkFfn`
+/// path. Call patches only execute on that path today — dense, Metal, and
+/// KV-cached paths are not yet wired.
+pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    patched: &larql_vindex::PatchedVindex,
+    config: WalkFfnConfig,
+    runner: R,
+    opts: PredictCallPatchesOptions,
+    eos: &EosConfig,
+) -> GenerateResultWithCallMetrics {
+    if max_tokens == 0 {
+        return GenerateResultWithCallMetrics {
+            tokens: Vec::new(),
+            prefill_ms: 0.0,
+            decode_ms: Vec::new(),
+            call_metrics: MontyCallMetrics::default(),
+            trace_events: Vec::new(),
+            error: None,
+        };
+    }
+
+    let base_runtime = MontyCallRuntime::new(runner);
+    let base_runtime = if opts.trace {
+        base_runtime.with_trace_events()
+    } else {
+        base_runtime
+    };
+    let runtime = RefCell::new(base_runtime);
+    runtime.borrow_mut().reset_sequence_state();
+
+    let mut current_ids = token_ids.to_vec();
+    let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
+    let mut decode_ms: Vec<f64> = Vec::with_capacity(max_tokens);
+
+    // First step treated as prefill.
+    let prefill_start = std::time::Instant::now();
+    let first = {
+        let ffn = WalkFfn::from_config(weights, patched, config.clone())
+            .with_call_patches(patched)
+            .with_call_runtime(&runtime);
+        predict_with_ffn(weights, tokenizer, &current_ids, 1, &ffn)
+    };
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let first_stop = match (first.token_ids.first(), first.predictions.first()) {
+        (Some(&id), Some(pred)) => {
+            let stop = eos.is_eos_with_tokenizer(id, &pred.0, tokenizer);
+            tokens.push((pred.0.clone(), 1.0));
+            current_ids.push(id);
+            stop
+        }
+        _ => {
+            let call_metrics = runtime.borrow().metrics();
+            let trace_events = runtime.borrow_mut().take_trace_events();
+            return GenerateResultWithCallMetrics {
+                tokens,
+                prefill_ms,
+                decode_ms,
+                call_metrics,
+                trace_events,
+                error: Some(GenerateError::empty_output(
+                    "generate_with_call_patches: no first token",
+                )),
+            };
+        }
+    };
+    if first_stop {
+        let call_metrics = runtime.borrow().metrics();
+        let trace_events = runtime.borrow_mut().take_trace_events();
+        return GenerateResultWithCallMetrics {
+            tokens,
+            prefill_ms,
+            decode_ms,
+            call_metrics,
+            trace_events,
+            error: None,
+        };
+    }
+
+    // Decode loop — O(N²) in growing sequence length.
+    for _step in 1..max_tokens {
+        let step_start = std::time::Instant::now();
+        let result = {
+            let ffn = WalkFfn::from_config(weights, patched, config.clone())
+                .with_call_patches(patched)
+                .with_call_runtime(&runtime);
+            predict_with_ffn(weights, tokenizer, &current_ids, 1, &ffn)
+        };
+        let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+        decode_ms.push(step_ms);
+
+        match (result.token_ids.first(), result.predictions.first()) {
+            (Some(&id), Some(pred)) => {
+                let stop = eos.is_eos_with_tokenizer(id, &pred.0, tokenizer);
+                tokens.push((pred.0.clone(), 1.0));
+                current_ids.push(id);
+                if stop {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let call_metrics = runtime.borrow().metrics();
+    let trace_events = runtime.borrow_mut().take_trace_events();
+    GenerateResultWithCallMetrics {
+        tokens,
+        prefill_ms,
+        decode_ms,
+        call_metrics,
+        trace_events,
+        error: None,
     }
 }
 
@@ -379,6 +560,122 @@ mod tests {
             "event should be Fired"
         );
         assert_eq!(result.trace_events[0].layer, 0);
+    }
+
+    #[test]
+    fn generate_with_call_patches_runner_accumulates_metrics_across_tokens() {
+        use crate::layer_graph::generate::EosConfig;
+
+        let mut fx = TestFixtures::build();
+        attach_feature_major_f32_to_test_vindex(&fx.weights, &mut fx.index);
+        let hidden = fx.weights.hidden_size;
+        let first_hidden = embed_tokens(&fx.weights, &[0u32]).row(0).to_vec();
+        let mut patched = larql_vindex::PatchedVindex::new(fx.index);
+        patched.insert_call_patch(
+            CallPatchOp {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: Value::Null,
+                output_schema: Value::Null,
+                trigger: CallTrigger::default(),
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy::default(),
+                metadata: Value::Null,
+            },
+            first_hidden.iter().map(|v| v * 100.0).collect(),
+        );
+        let result = generate_with_call_patches_runner(
+            &fx.weights,
+            &fx.tokenizer,
+            &[0u32],
+            3,
+            &patched,
+            WalkFfnConfig::sparse(fx.weights.num_layers, 1),
+            StaticRunner { hidden },
+            PredictCallPatchesOptions::default(),
+            &EosConfig::empty(),
+        );
+
+        assert!(!result.is_error(), "generate should succeed; err: {:?}", result.error);
+        assert!(!result.tokens.is_empty(), "should produce at least one token");
+        // Call patch fires on layer 0 at least once across the sequence.
+        assert!(
+            result.call_metrics.attempted >= 1,
+            "expected at least one call attempt"
+        );
+    }
+
+    #[test]
+    fn generate_with_call_patches_runner_zero_max_tokens_returns_empty() {
+        use crate::layer_graph::generate::EosConfig;
+
+        let mut fx = TestFixtures::build();
+        attach_feature_major_f32_to_test_vindex(&fx.weights, &mut fx.index);
+        let hidden = fx.weights.hidden_size;
+        let patched = larql_vindex::PatchedVindex::new(fx.index);
+        let result = generate_with_call_patches_runner(
+            &fx.weights,
+            &fx.tokenizer,
+            &[0u32],
+            0,
+            &patched,
+            WalkFfnConfig::sparse(fx.weights.num_layers, 1),
+            StaticRunner { hidden },
+            PredictCallPatchesOptions::default(),
+            &EosConfig::empty(),
+        );
+
+        assert!(result.tokens.is_empty());
+        assert!(!result.is_error());
+        assert_eq!(result.call_metrics.attempted, 0);
+    }
+
+    #[test]
+    fn generate_with_call_patches_runner_collects_trace_across_steps() {
+        use crate::layer_graph::generate::EosConfig;
+        use crate::monty_call::CallOutcome;
+
+        let mut fx = TestFixtures::build();
+        attach_feature_major_f32_to_test_vindex(&fx.weights, &mut fx.index);
+        let hidden = fx.weights.hidden_size;
+        let first_hidden = embed_tokens(&fx.weights, &[0u32]).row(0).to_vec();
+        let mut patched = larql_vindex::PatchedVindex::new(fx.index);
+        patched.insert_call_patch(
+            CallPatchOp {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: Value::Null,
+                output_schema: Value::Null,
+                trigger: CallTrigger::default(),
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy::default(),
+                metadata: Value::Null,
+            },
+            first_hidden.iter().map(|v| v * 100.0).collect(),
+        );
+        let result = generate_with_call_patches_runner(
+            &fx.weights,
+            &fx.tokenizer,
+            &[0u32],
+            2,
+            &patched,
+            WalkFfnConfig::sparse(fx.weights.num_layers, 1),
+            StaticRunner { hidden },
+            PredictCallPatchesOptions::default().with_trace(),
+            &EosConfig::empty(),
+        );
+
+        assert!(!result.trace_events.is_empty(), "trace events should be collected");
+        assert!(
+            result.trace_events.iter().any(|e| matches!(e.outcome, CallOutcome::Fired)),
+            "at least one Fired event expected"
+        );
     }
 
     #[test]
