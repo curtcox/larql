@@ -54,6 +54,10 @@ Already implemented in-tree
       `with_call_runtime(...)` hooks. Selected call features are looked up
       after gate selection, executed through the installed runtime, and skipped
       as static FFN rows.
+    * Sparse CPU `WalkFfn` now has synthetic coverage for selected call patches
+      firing, non-fired triggers leaving next-token logits unchanged, and
+      loaded-without-runtime call patches being skipped instead of treated as
+      static rows.
 
 Still remaining
 
@@ -76,10 +80,9 @@ Still remaining
 
 Recommended next milestone
 
-The next highest-leverage step is an end-to-end synthetic test where a
-file-backed call patch fires inside sparse CPU `WalkFfn`, returns a bounded
-residual delta through `MontyVmRunner`, and changes the expected next-token
-logits while the no-call and non-fired paths remain unchanged.
+The next highest-leverage step is to thread call-patch lookup/runtime hooks
+through a public inference entry point so callers can observe call metrics and
+trace events without constructing `WalkFfn` directly.
 
 Reading note
 

@@ -507,15 +507,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn walk_ffn_sparse_applies_selected_call_patch_delta() {
-        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
-        let weights = make_test_weights();
-        let mut base = make_test_vindex(&weights);
-        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
-        let hidden = weights.hidden_size;
-        let mut patched = larql_vindex::PatchedVindex::new(base);
-        patched.insert_call_patch(
+    fn call_patch_with_trigger(hidden: usize, trigger: CallTrigger) -> (CallPatchOp, Vec<f32>) {
+        (
             CallPatchOp {
                 layer: 0,
                 feature: 0,
@@ -524,13 +517,33 @@ mod tests {
                 code_hash: None,
                 input_schema: Value::Null,
                 output_schema: Value::Null,
-                trigger: CallTrigger::default(),
+                trigger,
                 limits: CallResourceLimits::default(),
                 safety: CallSafetyPolicy::default(),
                 metadata: Value::Null,
             },
             vec![100.0; hidden],
-        );
+        )
+    }
+
+    fn raw_lm_head_logits(weights: &larql_models::ModelWeights, residual: &[f32]) -> Vec<f32> {
+        weights
+            .lm_head
+            .outer_iter()
+            .map(|row| row.iter().zip(residual).map(|(a, b)| a * b).sum())
+            .collect()
+    }
+
+    #[test]
+    fn walk_ffn_sparse_applies_selected_call_patch_delta() {
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        let (call, gate_vector) = call_patch_with_trigger(hidden, CallTrigger::default());
+        patched.insert_call_patch(call, gate_vector);
         // Default trigger has max_calls_per_token=1 and require_top_k=1,
         // score_threshold=None. The gate vector [100.0; hidden] scores
         // far above any base feature for input [1.0; hidden], so this
@@ -547,6 +560,87 @@ mod tests {
 
         assert_eq!(out.row(0).to_vec(), vec![1.0; hidden]);
         assert_eq!(runtime.borrow().metrics().fired, 1);
+    }
+
+    #[test]
+    fn walk_ffn_sparse_skips_selected_call_patch_without_runtime() {
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        let (call, gate_vector) = call_patch_with_trigger(hidden, CallTrigger::default());
+        patched.insert_call_patch(call, gate_vector);
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 1);
+        let ffn = WalkFfn::from_config(&weights, &patched, cfg).with_call_patches(&patched);
+
+        let (out, _activation) = ffn
+            .walk_ffn_sparse(0, &Array2::from_elem((1, hidden), 1.0))
+            .expect("call-patched sparse walk should still produce zero output");
+
+        assert_eq!(out.row(0).to_vec(), vec![0.0; hidden]);
+    }
+
+    #[test]
+    fn walk_ffn_sparse_non_fired_call_patch_leaves_logits_unchanged() {
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        let mut trigger = CallTrigger::default();
+        trigger.score_threshold = Some(f32::MAX);
+        let (call, gate_vector) = call_patch_with_trigger(hidden, trigger);
+        patched.insert_call_patch(call, gate_vector);
+        let runtime = RefCell::new(MontyCallRuntime::new(StaticRunner { hidden }));
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 1);
+        let ffn = WalkFfn::from_config(&weights, &patched, cfg)
+            .with_call_patches(&patched)
+            .with_call_runtime(&runtime);
+
+        let (out, _activation) = ffn
+            .walk_ffn_sparse(0, &Array2::from_elem((1, hidden), 1.0))
+            .expect("non-fired call-patched sparse walk should produce output");
+        let logits = raw_lm_head_logits(&weights, out.row(0).as_slice().unwrap());
+
+        assert_eq!(out.row(0).to_vec(), vec![0.0; hidden]);
+        assert!(logits.iter().all(|v| *v == 0.0));
+        assert_eq!(runtime.borrow().metrics().fired, 0);
+        assert_eq!(runtime.borrow().metrics().skipped, 1);
+    }
+
+    #[test]
+    fn walk_ffn_sparse_fired_call_patch_changes_next_token_logits() {
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        let (call, gate_vector) = call_patch_with_trigger(hidden, CallTrigger::default());
+        patched.insert_call_patch(call, gate_vector);
+        let runtime = RefCell::new(MontyCallRuntime::new(StaticRunner { hidden }));
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 1);
+        let ffn = WalkFfn::from_config(&weights, &patched, cfg)
+            .with_call_patches(&patched)
+            .with_call_runtime(&runtime);
+
+        let (out, _activation) = ffn
+            .walk_ffn_sparse(0, &Array2::from_elem((1, hidden), 1.0))
+            .expect("fired call-patched sparse walk should produce output");
+        let no_call_logits = raw_lm_head_logits(&weights, &vec![0.0; hidden]);
+        let fired_logits = raw_lm_head_logits(&weights, out.row(0).as_slice().unwrap());
+
+        assert_eq!(runtime.borrow().metrics().fired, 1);
+        assert!(
+            fired_logits
+                .iter()
+                .zip(no_call_logits.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "call residual delta should perturb at least one next-token logit"
+        );
     }
 
     /// Sparse walk in full-K mode against the Q4K fixture (no native
