@@ -101,8 +101,14 @@ Implemented:
 - Opt-in sparse `WalkFfn` wiring for selected call patches. Call features are
   looked up after gate selection, executed through the installed runtime, and
   skipped as static FFN rows.
+- Dense and Metal/Q4 walk paths post-process FFN output with
+  `apply_call_patches_dense` after accelerated matmul completes.
+- Sparse full-K gemv and parallel Q4K down fast paths apply call patches per
+  position instead of bypassing the serial call loop.
+- Public helpers `predict_with_call_patches_runner` /
+  `generate_with_call_patches_runner` accept an optional GPU backend.
 
 Not implemented yet:
 
-- Dense, Metal, full-mmap, and batched prefill call execution paths.
+- Batched multi-layer GPU prefill with call patches.
 - Inline `ATTACH CALL ... INPUT ... OUTPUT ... TRIGGER ...` grammar.

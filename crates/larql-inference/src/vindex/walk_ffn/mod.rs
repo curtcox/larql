@@ -342,6 +342,34 @@ impl<'a> WalkFfn<'a> {
         x: &Array2<f32>,
         out: &mut Array2<f32>,
     ) {
+        let seq_len = x.shape()[0];
+        let hidden = x.shape()[1];
+        for s in 0..seq_len {
+            let x_row = x.row(s);
+            let x_slice: &[f32] = if let Some(sl) = x_row.as_slice() {
+                sl
+            } else {
+                continue;
+            };
+            self.apply_call_patches_for_position(
+                layer,
+                x_slice,
+                self.call_position_base.get() + s,
+                hidden,
+                &mut out.row_mut(s),
+            );
+        }
+    }
+
+    /// Apply call patches for a single sequence position in-place on `out_row`.
+    pub(super) fn apply_call_patches_for_position(
+        &self,
+        layer: usize,
+        x_slice: &[f32],
+        position: usize,
+        hidden: usize,
+        out_row: &mut ndarray::ArrayViewMut1<f32>,
+    ) {
         let patches = match self.call_patches {
             Some(p) => p,
             None => return,
@@ -356,67 +384,50 @@ impl<'a> WalkFfn<'a> {
             return;
         }
 
-        let seq_len = x.shape()[0];
-        let hidden = x.shape()[1];
+        let mut scored: Vec<(usize, f32)> = layer_patches
+            .iter()
+            .map(|(feat, _, gate)| {
+                let score: f32 = gate.iter().zip(x_slice.iter()).map(|(a, b)| a * b).sum();
+                (*feat, score)
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        for s in 0..seq_len {
-            let x_row = x.row(s);
-            let x_slice: &[f32] = if let Some(sl) = x_row.as_slice() {
-                sl
-            } else {
-                // Non-contiguous row — skip; this is a correctness
-                // guard, not a hot path.
-                continue;
+        let mut calls_fired_this_position: usize = 0;
+        for (rank_idx, (feat, score)) in scored.iter().enumerate() {
+            let call = match layer_patches.iter().find(|(f, _, _)| f == feat) {
+                Some((_, c, _)) => *c,
+                None => continue,
             };
 
-            // Score every call patch for this position, then rank by score.
-            let mut scored: Vec<(usize, f32)> = layer_patches
-                .iter()
-                .map(|(feat, _, gate)| {
-                    let score: f32 = gate.iter().zip(x_slice.iter()).map(|(a, b)| a * b).sum();
-                    (*feat, score)
-                })
-                .collect();
-            scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let margin = if rank_idx + 1 < scored.len() {
+                Some(score - scored[rank_idx + 1].1)
+            } else {
+                None
+            };
 
-            let mut calls_fired_this_position: usize = 0;
-            for (rank_idx, (feat, score)) in scored.iter().enumerate() {
-                // Find the call op for this feature.
-                let call = match layer_patches.iter().find(|(f, _, _)| f == feat) {
-                    Some((_, c, _)) => *c,
-                    None => continue,
-                };
-
-                let margin = if rank_idx + 1 < scored.len() {
-                    Some(score - scored[rank_idx + 1].1)
-                } else {
-                    None
-                };
-
-                let ctx = crate::monty_call::CallContext {
-                    layer,
-                    position: self.call_position_base.get() + s,
-                    residual: x_slice,
-                    token_ids: &[],
-                    token_text: None,
-                };
-                if let Ok(Some(call_output)) = runtime.execute_call(
-                    call,
-                    crate::monty_call::CallCandidate {
-                        rank: rank_idx + 1,
-                        score: *score,
-                        margin,
-                        calls_already_fired: calls_fired_this_position,
-                    },
-                    &ctx,
-                    hidden,
-                ) {
-                    calls_fired_this_position += 1;
-                    if let Some(delta) = call_output.residual_delta {
-                        if delta.len() == hidden {
-                            out.row_mut(s)
-                                .scaled_add(1.0, &ndarray::ArrayView1::from(delta.as_slice()));
-                        }
+            let ctx = crate::monty_call::CallContext {
+                layer,
+                position,
+                residual: x_slice,
+                token_ids: &[],
+                token_text: None,
+            };
+            if let Ok(Some(call_output)) = runtime.execute_call(
+                call,
+                crate::monty_call::CallCandidate {
+                    rank: rank_idx + 1,
+                    score: *score,
+                    margin,
+                    calls_already_fired: calls_fired_this_position,
+                },
+                &ctx,
+                hidden,
+            ) {
+                calls_fired_this_position += 1;
+                if let Some(delta) = call_output.residual_delta {
+                    if delta.len() == hidden {
+                        out_row.scaled_add(1.0, &ndarray::ArrayView1::from(delta.as_slice()));
                     }
                 }
             }
@@ -460,7 +471,10 @@ impl<'a> FfnBackend for WalkFfn<'a> {
         // hash of the residual, so any walk path that produces the
         // same output fills the same slot.
         let seq_len = x.shape()[0];
-        let l1_key: Option<u64> = if seq_len == 1 && self.l1_cache.is_some() {
+        let l1_key: Option<u64> = if seq_len == 1
+            && self.l1_cache.is_some()
+            && self.call_patches.is_none()
+        {
             let x_row = x.row(0);
             let owned;
             let slice: &[f32] = if let Some(s) = x_row.as_slice() {

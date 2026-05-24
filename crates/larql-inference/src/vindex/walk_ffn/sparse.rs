@@ -134,6 +134,7 @@ impl<'a> WalkFfn<'a> {
                     if let Some(out_matmul) = out_matmul {
                         out.assign(&out_matmul);
                         full_activation.assign(&activation);
+                        self.apply_call_patches_dense(layer, x, &mut out);
                         self.trace_path(layer, "sparse:gemv_full_k");
                         return Some((out, full_activation));
                     }
@@ -263,6 +264,14 @@ impl<'a> WalkFfn<'a> {
                     h.reduce_ns.fetch_add(reduce_ns, Relaxed);
                     h.calls.fetch_add(1, Relaxed);
                 }
+
+                self.apply_call_patches_for_position(
+                    layer,
+                    x_slice,
+                    self.call_position_base.get() + s,
+                    hidden,
+                    &mut out_row,
+                );
 
                 self.trace_path(layer, "sparse:parallel_q4k_down");
                 continue;
@@ -640,6 +649,44 @@ mod tests {
                 .zip(no_call_logits.iter())
                 .any(|(a, b)| (a - b).abs() > 1e-6),
             "call residual delta should perturb at least one next-token logit"
+        );
+    }
+
+    #[test]
+    fn walk_ffn_sparse_full_k_applies_call_patch_delta() {
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let input = Array2::from_elem((1, hidden), 1.0);
+        let cfg = WalkFfnConfig::dense(weights.num_layers);
+        let baseline = WalkFfn::from_config(&weights, &base, cfg.clone())
+            .walk_ffn_sparse(0, &input)
+            .expect("baseline full-K sparse walk")
+            .0
+            .row(0)
+            .to_vec();
+
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        let (call, gate_vector) = call_patch_with_trigger(hidden, CallTrigger::default());
+        patched.insert_call_patch(call, gate_vector);
+        let runtime = RefCell::new(MontyCallRuntime::new(StaticRunner { hidden }));
+        let ffn = WalkFfn::from_config(&weights, &patched, cfg)
+            .with_call_patches(&patched)
+            .with_call_runtime(&runtime);
+
+        let out = ffn
+            .walk_ffn_sparse(0, &input)
+            .expect("full-K sparse walk with call patch")
+            .0
+            .row(0)
+            .to_vec();
+
+        assert_eq!(runtime.borrow().metrics().fired, 1);
+        assert!(
+            out.iter().zip(baseline.iter()).any(|(a, b)| (a - b).abs() > 1e-6),
+            "full-K gemv path should apply call residual delta on top of base output"
         );
     }
 

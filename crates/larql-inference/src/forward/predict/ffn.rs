@@ -108,12 +108,16 @@ pub fn predict_with_call_patches(
         config,
         MontyVmRunner::new(),
         PredictCallPatchesOptions::default(),
+        None,
     )
 }
 
 /// Run a vindex-backed forward pass with runtime call patches enabled and a
 /// caller-supplied runner. This is primarily useful for embedding tests,
 /// deterministic fakes, or hosted Monty runners.
+///
+/// Pass `backend` (e.g. `MetalBackend`) to route dense/Q4/Q4K walk paths through
+/// GPU kernels; call patches still execute on CPU after the matmul completes.
 pub fn predict_with_call_patches_runner<R: CallProgramRunner>(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
@@ -123,6 +127,7 @@ pub fn predict_with_call_patches_runner<R: CallProgramRunner>(
     config: WalkFfnConfig,
     runner: R,
     opts: PredictCallPatchesOptions,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> PredictResultWithCallMetrics {
     let base_runtime = MontyCallRuntime::new(runner);
     let base_runtime = if opts.trace {
@@ -131,9 +136,12 @@ pub fn predict_with_call_patches_runner<R: CallProgramRunner>(
         base_runtime
     };
     let runtime = RefCell::new(base_runtime);
-    let ffn = WalkFfn::from_config(weights, patched, config)
+    let mut ffn = WalkFfn::from_config(weights, patched, config)
         .with_call_patches(patched)
         .with_call_runtime(&runtime);
+    if let Some(be) = backend {
+        ffn = ffn.with_backend(be);
+    }
     let result = predict_with_ffn(weights, tokenizer, token_ids, top_k, &ffn);
     drop(ffn);
     let call_metrics = runtime.borrow().metrics();
@@ -194,6 +202,7 @@ pub fn generate_with_call_patches(
         config,
         MontyVmRunner::new(),
         PredictCallPatchesOptions::default(),
+        None,
         eos,
     )
 }
@@ -209,6 +218,9 @@ pub fn generate_with_call_patches(
 /// Uses the production KV-cached CPU loop (prefill once, then single-token
 /// decode steps) so call patches fire on both sparse and dense `WalkFfn`
 /// paths without re-running the full prompt each token.
+///
+/// Pass `backend` to enable Metal/GPU matmul paths; call patches execute on
+/// CPU after the accelerated FFN completes.
 pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
     weights: &ModelWeights,
     tokenizer: &tokenizers::Tokenizer,
@@ -218,6 +230,7 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
     config: WalkFfnConfig,
     runner: R,
     opts: PredictCallPatchesOptions,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
     eos: &EosConfig,
 ) -> GenerateResultWithCallMetrics {
     if max_tokens == 0 {
@@ -250,9 +263,12 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
     let runtime = RefCell::new(base_runtime);
     runtime.borrow_mut().reset_sequence_state();
 
-    let ffn = WalkFfn::from_config(weights, patched, config)
+    let mut ffn = WalkFfn::from_config(weights, patched, config)
         .with_call_patches(patched)
         .with_call_runtime(&runtime);
+    if let Some(be) = backend {
+        ffn = ffn.with_backend(be);
+    }
 
     let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
     let mut decode_ms: Vec<f64> = Vec::with_capacity(max_tokens);
@@ -625,6 +641,7 @@ mod tests {
             WalkFfnConfig::sparse(fx.weights.num_layers, 1),
             StaticRunner { hidden },
             PredictCallPatchesOptions::default(),
+            None,
         );
 
         assert!(result.predictions.len() <= 3);
@@ -666,6 +683,7 @@ mod tests {
             WalkFfnConfig::sparse(fx.weights.num_layers, 1),
             StaticRunner { hidden },
             PredictCallPatchesOptions::default().with_trace(),
+            None,
         );
 
         assert_eq!(result.call_metrics.fired, 1);
@@ -711,6 +729,7 @@ mod tests {
             WalkFfnConfig::sparse(fx.weights.num_layers, 1),
             StaticRunner { hidden },
             PredictCallPatchesOptions::default(),
+            None,
             &EosConfig::empty(),
         );
 
@@ -740,6 +759,7 @@ mod tests {
             WalkFfnConfig::sparse(fx.weights.num_layers, 1),
             StaticRunner { hidden },
             PredictCallPatchesOptions::default(),
+            None,
             &EosConfig::empty(),
         );
 
@@ -783,6 +803,7 @@ mod tests {
             WalkFfnConfig::sparse(fx.weights.num_layers, 1),
             StaticRunner { hidden },
             PredictCallPatchesOptions::default().with_trace(),
+            None,
             &EosConfig::empty(),
         );
 

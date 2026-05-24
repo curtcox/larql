@@ -11,10 +11,11 @@ This document is now split into two readings:
   trace events, M5 safety hardening, multi-token generation with call patches,
   and dense-path call patch wiring (full_mmap, interleaved, kquant_native,
   kquant_dequant, exact, and weights_fallback paths now support call patches
-  via the `apply_call_patches_dense` post-processing step).
-* **Remaining**: Metal/GPU path wiring, batched prefill beyond the KV-cached
-  CPU generation loop, production safety hardening, benchmarks, and the
-  training pipeline.
+  via the `apply_call_patches_dense` post-processing step), Metal/GPU walk path
+  wiring (interleaved Q4 Metal/CPU, sparse full-K gemv, parallel Q4K down, and
+  optional backend on public predict/generate helpers).
+* **Remaining**: batched prefill beyond the KV-cached CPU generation loop,
+  production safety hardening, benchmarks, and the training pipeline.
 
 Already implemented in-tree
 
@@ -71,8 +72,7 @@ Already implemented in-tree
 
 Still remaining
 
-* Extend execution beyond CPU `WalkFfn` paths:
-    * Metal/GPU paths
+* Extend execution beyond single-stream KV-cached generation:
     * batched prefill beyond the KV-cached generation loop
 * Expand inline LQL beyond the current file-backed/gate-code vertical slice if
   richer `INPUT (...)`, `OUTPUT (...)`, and policy grammar proves necessary.
@@ -97,8 +97,8 @@ Multi-token generation with call patches is now implemented via
 state once at the start, and return `GenerateResultWithCallMetrics` with
 aggregate `call_metrics` and optional per-event `trace_events`.
 
-The next highest-leverage step is Metal/GPU path wiring for call patches and
-batched prefill integration beyond the KV-cached CPU generation loop.
+The next highest-leverage step is batched prefill integration beyond the
+KV-cached single-stream CPU generation loop.
 
 Reading note
 
@@ -213,6 +213,20 @@ Dense CPU path wiring — complete:
   `apply_call_patches_dense_no_op_without_runtime`,
   `apply_call_patches_dense_respects_score_threshold`.
 
+Metal/GPU path wiring — complete:
+
+* `interleaved_q4` (Metal Q4_0 and CPU fallback) post-processes with
+  `apply_call_patches_dense` after the accelerated matmul.
+* Sparse `sparse:gemv_full_k` and `sparse:parallel_q4k_down` fast paths apply
+  call patches per position via `apply_call_patches_for_position` / dense
+  post-processing instead of bypassing the serial call-patch loop.
+* L1 FFN cache is disabled when call patches are loaded (cached outputs would
+  omit position-dependent call state).
+* `predict_with_call_patches_runner` and `generate_with_call_patches_runner`
+  accept an optional `backend: Option<&dyn ComputeBackend>` so callers can route
+  dense/Q4/Q4K matmul through Metal while Monty execution stays on CPU.
+* New test: `walk_ffn_sparse_full_k_applies_call_patch_delta`.
+
 KV-cached CPU generation — complete:
 
 * `generate_with_call_patches_runner` now uses a production KV-cached loop
@@ -224,11 +238,12 @@ KV-cached CPU generation — complete:
 
 Still incomplete:
 
-* Metal/GPU paths — deferred per the CPU-first policy from the plan.
 * Batched prefill integration beyond the KV-cached single-stream loop.
 * Cross-layer KV sharing on the call-patch generation path (same constraint as
   `supports_cached_decode` — architectures with `kv_shared_source_layer` need
   a dedicated path).
+* `PipelinedLayerGraph` / multi-layer GPU batch FFN does not yet thread call
+  patches (single-layer `WalkFfn` paths are covered).
 
 ⸻
 

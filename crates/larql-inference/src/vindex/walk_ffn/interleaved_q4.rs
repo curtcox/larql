@@ -126,6 +126,7 @@ impl<'a> WalkFfn<'a> {
             crate::forward::add_bias(&mut out, bias);
         }
 
+        self.apply_call_patches_dense(layer, x, &mut out);
         Some((out, full_activation))
     }
 }
