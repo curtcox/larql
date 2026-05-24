@@ -864,6 +864,118 @@ fn fused_decode_step_inner(
     Array2::from_shape_vec((1, hidden), h_vec).ok()
 }
 
+/// Metal-fused single-token decode with Monty call patches applied per layer
+/// after the GPU FFN completes. Requires a prior
+/// [`fused_prefill_with_call_patches`] (or [`fused_prefill`]) on the same
+/// backend to populate the Metal K/V cache.
+pub fn fused_decode_step_with_call_patches<R: crate::monty_call::CallProgramRunner>(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_id: u32,
+    backend: &dyn ComputeBackend,
+    ctx: &KquantCallPatchCtx<'_, R>,
+) -> Option<Array2<f32>> {
+    let has_call_patches = (0..weights.num_layers)
+        .any(|l| !ctx.patched.call_patches_for_layer(l).is_empty());
+    if !has_call_patches {
+        return fused_decode_step(weights, index, token_id, backend);
+    }
+    if !supports_fused_prefill_with_call_patches(weights, index, ctx.patched, backend) {
+        return None;
+    }
+
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    {
+        use crate::layer_graph::pipeline_layer::build_pipeline_layers;
+        use larql_vindex::GateIndex;
+
+        let metal_be = backend
+            .as_any()
+            .downcast_ref::<larql_compute_metal::MetalBackend>()?;
+
+        let gate_index: &dyn GateIndex = index;
+        let (q4_ffn_mmap, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_kquant_mmap_ref() {
+            (m, true)
+        } else if let Some(m) = gate_index.interleaved_q4_mmap_ref() {
+            (m, false)
+        } else {
+            return None;
+        };
+
+        let hidden = weights.hidden_size;
+        let num_layers = weights.num_layers;
+        let intermediate = gate_index.num_features(0);
+        if intermediate == 0 {
+            return None;
+        }
+
+        let ffn_format = if ffn_is_q4k {
+            larql_compute::QuantFormat::Q4_K
+        } else {
+            larql_compute::QuantFormat::Q4_0
+        };
+        let q4_ffn_per_matrix = ffn_format.packed_matrix_bytes(intermediate, hidden)?;
+
+        let layers = build_pipeline_layers(
+            weights,
+            index,
+            0..num_layers,
+            q4_ffn_mmap,
+            q4_ffn_per_matrix,
+            ffn_format,
+        );
+
+        let h_tok = crate::forward::embed_tokens_pub(weights, &[token_id]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+
+        if backend.supports(larql_compute::Capability::PerLayerEmbeddings) {
+            let ple_dim = weights.arch.per_layer_embed_dim();
+            if ple_dim > 0 {
+                let per_layer_inputs = crate::forward::ple::precompute_per_layer_inputs(
+                    weights,
+                    &h_tok,
+                    &[token_id],
+                );
+                let mut flat: Vec<f32> = Vec::with_capacity(num_layers * ple_dim);
+                for layer_arr in &per_layer_inputs {
+                    for v in layer_arr.row(0).iter() {
+                        flat.push(*v);
+                    }
+                }
+                backend.prepare_ple_inputs(&flat, num_layers, ple_dim);
+            }
+        }
+
+        let mut walk_ffn = WalkFfn::from_config(weights, ctx.patched, ctx.config.clone())
+            .with_call_patches(ctx.patched)
+            .with_call_runtime(ctx.runtime as &dyn WalkCallRuntime);
+        if let Some(be) = ctx.matmul_backend {
+            walk_ffn = walk_ffn.with_backend(be);
+        }
+        walk_ffn.set_call_position_base(ctx.call_position_base);
+
+        let mut post_ffn = |layer: usize, ffn_norm: &[f32], h_out: &mut [f32]| {
+            walk_ffn.apply_call_patches_to_buffers(layer, 1, hidden, ffn_norm, h_out);
+        };
+
+        let h_vec = metal_be.decode_kquant_with_post_ffn_fn(
+            &layers,
+            &x_dec,
+            hidden,
+            intermediate,
+            &mut post_ffn,
+        )?;
+
+        return Array2::from_shape_vec((1, hidden), h_vec).ok();
+    }
+
+    #[cfg(not(all(feature = "gpu", target_os = "macos")))]
+    {
+        let _ = (weights, index, token_id, backend, ctx);
+        None
+    }
+}
+
 /// Production-path attention decode step reading **quantised** weights
 /// from the vindex (not f32 dequantised tensors). Same input/output
 /// shape as
@@ -1536,6 +1648,33 @@ mod tests {
         assert!(
             result.is_none(),
             "synthetic vindex without interleaved fused-pipeline bytes must short-circuit"
+        );
+    }
+
+    #[test]
+    fn fused_decode_step_with_call_patches_returns_none_on_synthetic_vindex() {
+        use crate::monty_call::{MontyCallRuntime, MontyVmRunner};
+        use crate::vindex::walk_config::WalkFfnConfig;
+        use larql_vindex::PatchedVindex;
+
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = CpuBackend;
+        let patched = PatchedVindex::new(index.clone());
+        let runtime = std::cell::RefCell::new(MontyCallRuntime::new(MontyVmRunner::new()));
+        let ctx = KquantCallPatchCtx {
+            tensor_index: &index,
+            patched: &patched,
+            config: WalkFfnConfig::default(),
+            runtime: &runtime,
+            call_position_base: 0,
+            matmul_backend: None,
+        };
+        let result =
+            fused_decode_step_with_call_patches(&weights, &index, 0, &backend, &ctx);
+        assert!(
+            result.is_none(),
+            "synthetic vindex without fused-pipeline bytes must short-circuit"
         );
     }
 }

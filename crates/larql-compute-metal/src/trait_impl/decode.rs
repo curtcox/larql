@@ -819,6 +819,7 @@ impl DecodeBackend for MetalBackend {
             rope_base,
             Some(&mut fire_wrapper),
             Some(moe_collect_fn),
+            None, // post_ffn_fn
             None, // no state capture on split fire/collect MoE path
             larql_compute::StateDumpMask::Full,
         ))

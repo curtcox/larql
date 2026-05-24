@@ -216,11 +216,13 @@ pub fn generate_with_call_patches(
 /// sequence.
 ///
 /// Uses a production KV-cached loop (prefill once, then single-token decode
-/// steps). When the model and vindex support Q4K cached decode
+/// steps). When a Metal backend is supplied and
+/// [`crate::vindex::supports_fused_prefill_with_call_patches`] holds, prefill
+/// and decode run through the fused GPU pipeline with Monty hooks. Otherwise,
+/// when the model and vindex support Q4K cached decode
 /// ([`crate::vindex::supports_kquant_cached_custom_ffn`]), prefill and decode
-/// run through that driver with [`WalkFfn`] so batched prompt positions and
-/// decode steps both fire call patches. Otherwise falls back to the generic
-/// layer loop in [`kv_prefill_with_call_ffn`].
+/// run through the CPU Q4K driver with [`WalkFfn`]. Otherwise falls back to
+/// the generic layer loop in [`kv_prefill_with_call_ffn`].
 ///
 /// Pass `backend` to enable Metal/GPU matmul paths; call patches execute on
 /// CPU after the accelerated FFN completes.
@@ -266,11 +268,95 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
     let runtime = RefCell::new(base_runtime);
     runtime.borrow_mut().reset_sequence_state();
 
-    let use_kquant_cached =
-        crate::vindex::supports_kquant_cached_custom_ffn(weights, patched.base());
+    let use_fused_gpu_call = backend.is_some_and(|be| {
+        crate::vindex::supports_fused_prefill_with_call_patches(
+            weights,
+            patched.base(),
+            patched,
+            be,
+        )
+    });
 
     let mut tokens: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
     let mut decode_ms: Vec<f64> = Vec::with_capacity(max_tokens);
+
+    if use_fused_gpu_call {
+        let backend = backend.expect("use_fused_gpu_call implies Some(backend)");
+        let tensor_index = patched.base();
+        let prefill_start = std::time::Instant::now();
+        let kquant_ctx = crate::vindex::KquantCallPatchCtx {
+            tensor_index,
+            patched,
+            config: config.clone(),
+            runtime: &runtime,
+            call_position_base: 0,
+            matmul_backend: Some(backend),
+        };
+        let h_last = match crate::vindex::fused_prefill_with_call_patches(
+            weights,
+            tensor_index,
+            token_ids,
+            backend,
+            &kquant_ctx,
+        ) {
+            Some(h) => h,
+            None => {
+                let call_metrics = runtime.borrow().metrics();
+                let trace_events = runtime.borrow_mut().take_trace_events();
+                return GenerateResultWithCallMetrics {
+                    tokens,
+                    prefill_ms: 0.0,
+                    decode_ms,
+                    call_metrics,
+                    trace_events,
+                    error: Some(GenerateError::empty_output(
+                        "generate_with_call_patches: fused GPU prefill failed",
+                    )),
+                };
+            }
+        };
+        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+        match sample_first_and_decode_loop_fused_gpu(
+            weights,
+            tokenizer,
+            config,
+            eos,
+            max_tokens,
+            &h_last,
+            token_ids.len(),
+            &mut tokens,
+            &mut decode_ms,
+            &kquant_ctx,
+        ) {
+            Ok(()) => {
+                let call_metrics = runtime.borrow().metrics();
+                let trace_events = runtime.borrow_mut().take_trace_events();
+                return GenerateResultWithCallMetrics {
+                    tokens,
+                    prefill_ms,
+                    decode_ms,
+                    call_metrics,
+                    trace_events,
+                    error: None,
+                };
+            }
+            Err(err) => {
+                let call_metrics = runtime.borrow().metrics();
+                let trace_events = runtime.borrow_mut().take_trace_events();
+                return GenerateResultWithCallMetrics {
+                    tokens,
+                    prefill_ms,
+                    decode_ms,
+                    call_metrics,
+                    trace_events,
+                    error: Some(err),
+                };
+            }
+        }
+    }
+
+    let use_kquant_cached =
+        crate::vindex::supports_kquant_cached_custom_ffn(weights, patched.base());
 
     if use_kquant_cached {
         let tensor_index = patched.base();
@@ -381,6 +467,79 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
 
 struct KquantCallDecodeState {
     cache: crate::vindex::CpuKvCache,
+}
+
+/// After fused GPU prefill: sample first token and run Metal decode loop.
+fn sample_first_and_decode_loop_fused_gpu<R: CallProgramRunner>(
+    weights: &ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    config: WalkFfnConfig,
+    eos: &EosConfig,
+    max_tokens: usize,
+    first_hidden: &Array2<f32>,
+    mut next_position: usize,
+    tokens: &mut Vec<(String, f64)>,
+    decode_ms: &mut Vec<f64>,
+    kquant_ctx_template: &crate::vindex::KquantCallPatchCtx<'_, R>,
+) -> Result<(), GenerateError> {
+    let backend = kquant_ctx_template
+        .matmul_backend
+        .expect("fused GPU path requires matmul_backend");
+    let first = logits_to_predictions(weights, first_hidden, tokenizer, 1, 1.0);
+    let first_stop = match (first.token_ids.first(), first.predictions.first()) {
+        (Some(&id), Some(pred)) => {
+            let stop = eos.is_eos_with_tokenizer(id, &pred.0, tokenizer);
+            tokens.push((pred.0.clone(), 1.0));
+            stop
+        }
+        _ => {
+            return Err(GenerateError::empty_output(
+                "generate_with_call_patches: no first token",
+            ));
+        }
+    };
+    if first_stop || max_tokens == 1 {
+        return Ok(());
+    }
+
+    let mut current_id = first.token_ids[0];
+    for _step in 1..max_tokens {
+        let step_start = std::time::Instant::now();
+        let step_ctx = crate::vindex::KquantCallPatchCtx {
+            tensor_index: kquant_ctx_template.tensor_index,
+            patched: kquant_ctx_template.patched,
+            config: config.clone(),
+            runtime: kquant_ctx_template.runtime,
+            call_position_base: next_position,
+            matmul_backend: Some(backend),
+        };
+        let h_step = match crate::vindex::fused_decode_step_with_call_patches(
+            weights,
+            kquant_ctx_template.tensor_index,
+            current_id,
+            backend,
+            &step_ctx,
+        ) {
+            Some(h) => h,
+            None => break,
+        };
+        next_position += 1;
+        decode_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
+
+        let result = logits_to_predictions(weights, &h_step, tokenizer, 1, 1.0);
+        match (result.token_ids.first(), result.predictions.first()) {
+            (Some(&id), Some(pred)) => {
+                let stop = eos.is_eos_with_tokenizer(id, &pred.0, tokenizer);
+                tokens.push((pred.0.clone(), 1.0));
+                current_id = id;
+                if stop {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(())
 }
 
 /// After Q4K cached prefill: sample first token and run decode loop.

@@ -161,6 +161,7 @@ impl MetalBackend {
             moe_fn,
             None,
             None,
+            None,
             larql_compute::StateDumpMask::Full,
         )
     }
@@ -245,6 +246,7 @@ impl MetalBackend {
             rope_base,
             None,
             None,
+            None,
             Some(state),
             mask,
         )
@@ -269,6 +271,7 @@ impl MetalBackend {
         _rope_base: f32,
         mut moe_fn: Option<&mut dyn FnMut(usize, &[f32]) -> Vec<f32>>,
         mut moe_collect_fn: Option<&mut dyn FnMut(usize) -> Vec<f32>>,
+        mut post_ffn_fn: Option<&mut dyn FnMut(usize, &[f32], &mut [f32])>,
         mut state_dump: Option<&mut larql_compute::DecodeStateDump>,
         state_dump_mask: larql_compute::StateDumpMask,
     ) -> Vec<f32> {
@@ -606,17 +609,19 @@ impl MetalBackend {
                 // `encode_post_ffn_residual` so it can fuse the residual
                 // add with the next layer's input rms_norm in one
                 // `residual_norm_store` dispatch. Saves 1 dispatch/layer.
-                let prelayer_fusion =
-                    if !layer.has_post_norms && self.decode_flags.fused_prelayer_norm {
-                        layers.get(l + 1).map(|next| {
-                            super::decode::encode_post_ffn::PreLayerNormFusion {
-                                next_input_norm: next.input_norm,
-                                next_norm_out: &norm_f32_buf,
-                            }
-                        })
-                    } else {
-                        None
-                    };
+                let prelayer_fusion = if post_ffn_fn.is_some() {
+                    // Per-layer readback invalidates cross-layer norm fusion.
+                    None
+                } else if !layer.has_post_norms && self.decode_flags.fused_prelayer_norm {
+                    layers.get(l + 1).map(|next| {
+                        super::decode::encode_post_ffn::PreLayerNormFusion {
+                            next_input_norm: next.input_norm,
+                            next_norm_out: &norm_f32_buf,
+                        }
+                    })
+                } else {
+                    None
+                };
 
                 if stage_timing_split && !has_moe {
                     // Fine split: gate+up in one CB, act+down+residual in another.
@@ -801,6 +806,34 @@ impl MetalBackend {
                         hidden,
                         layer.layer_scalar,
                     );
+                }
+            }
+
+            // Monty call-patch hook: per-layer CPU callback after dense FFN
+            // (mirrors `dispatch_full_pipeline` `post_ffn_fn`).
+            if let Some(ref mut f) = post_ffn_fn {
+                if !defer_ffn_for_split && !layer.ffn_is_remote {
+                    if !encoder_ended {
+                        enc.end_encoding();
+                    }
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    encoder_ended = true;
+
+                    let ffn_norm_bytes = super::buffers::read_buffer_f32(&ffn_norm_out, hidden);
+                    let mut h_bytes = super::buffers::read_buffer_f32(new_h, hidden);
+                    f(l, &ffn_norm_bytes, &mut h_bytes);
+                    let ptr = new_h.contents() as *mut f32;
+                    // SAFETY: GPU finished; buffer sized for `hidden` f32s.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(h_bytes.as_ptr(), ptr, hidden);
+                    }
+
+                    if l + 1 < num_layers {
+                        cmd = self.queue.new_command_buffer().to_owned();
+                        enc = cmd.new_compute_command_encoder().to_owned();
+                        encoder_ended = false;
+                    }
                 }
             }
 
@@ -1094,6 +1127,90 @@ impl MetalBackend {
             Some(post_ffn_fn),
             None,
         ))
+    }
+
+    /// Fused single-token decode with a per-layer CPU hook after dense FFN
+    /// (Monty call patches). Uses the backend's persistent K/V cache (must
+    /// be populated by a prior [`Self::prefill_kquant_with_post_ffn_fn`] or
+    /// [`DecodeBackend::prefill_kquant`] call).
+    pub fn decode_kquant_with_post_ffn_fn(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        post_ffn_fn: &mut dyn FnMut(usize, &[f32], &mut [f32]),
+    ) -> Option<Vec<f32>> {
+        let (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim, rope_base) =
+            match layers.first() {
+                Some(l) => (
+                    l.num_q_heads * l.head_dim,
+                    l.num_kv_heads * l.head_dim,
+                    l.num_q_heads,
+                    l.num_kv_heads,
+                    l.head_dim,
+                    l.rope_base,
+                ),
+                None => (0, 0, 0, 0, 0, 0.0),
+            };
+        let mut cache_guard = self.kv_cache.lock().unwrap();
+        let kv = self.ensure_kv_cache_for_layers(
+            &mut cache_guard,
+            layers,
+            DEFAULT_KV_CACHE_MAX_SEQ,
+        );
+        Some(self.decode_token_with_post_ffn_fn(
+            kv,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            post_ffn_fn,
+        ))
+    }
+
+    /// Fused single-token decode with a per-layer CPU hook after dense FFN
+    /// (Monty call patches).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_token_with_post_ffn_fn(
+        &self,
+        kv_cache: &mut ops::kv_cache::KVCache,
+        layers: &[larql_compute::FullPipelineLayer],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_base: f32,
+        post_ffn_fn: &mut dyn FnMut(usize, &[f32], &mut [f32]),
+    ) -> Vec<f32> {
+        self.decode_token_with_moe_split_fn(
+            kv_cache,
+            layers,
+            x,
+            hidden,
+            inter,
+            q_dim,
+            kv_dim,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base,
+            None,
+            None,
+            Some(post_ffn_fn),
+            None,
+            larql_compute::StateDumpMask::Full,
+        )
     }
 
     /// Local-expert path — delegates to `decode_token_with_moe_fn` with no hook.

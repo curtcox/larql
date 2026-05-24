@@ -13,9 +13,12 @@ This document is now split into two readings:
   kquant_dequant, exact, and weights_fallback paths now support call patches
   via the `apply_call_patches_dense` post-processing step), Metal/GPU walk path
   wiring (interleaved Q4 Metal/CPU, sparse full-K gemv, parallel Q4K down, and
-  optional backend on public predict/generate helpers).
-* **Remaining**: fused GPU `decode_token` with call patches (prefill hook is
-  wired), production safety hardening, benchmarks, and the training pipeline.
+  optional backend on public predict/generate helpers), fused GPU prefill +
+  decode with call patches (`fused_prefill_with_call_patches` /
+  `fused_decode_step_with_call_patches`; `generate_with_call_patches_runner`
+  routes end-to-end on Metal when eligible).
+* **Remaining**: production safety hardening, benchmarks, and the training
+  pipeline.
 
 Already implemented in-tree
 
@@ -73,8 +76,8 @@ Already implemented in-tree
 Still remaining
 
 * Extend execution beyond single-stream KV-cached generation:
-    * fused GPU `prefill_kquant` with call patches (CPU Q4K batched prefill path is wired)
-    * cross-layer KV sharing on the call-patch generation path
+    * ~~fused GPU `prefill_kquant` with call patches~~ (done)
+    * ~~fused GPU `decode_token` with call patches~~ (done)
 * Expand inline LQL beyond the current file-backed/gate-code vertical slice if
   richer `INPUT (...)`, `OUTPUT (...)`, and policy grammar proves necessary.
 * Build the codec roadmap beyond the current raw residual / top-k basis /
@@ -98,8 +101,9 @@ Multi-token generation with call patches is now implemented via
 state once at the start, and return `GenerateResultWithCallMetrics` with
 aggregate `call_metrics` and optional per-event `trace_events`.
 
-The next highest-leverage step is fused GPU `decode_token` with call patches so
-`generate_with_call_patches` can stay on the Metal KV cache end-to-end.
+The next highest-leverage steps are production safety hardening, benchmarks,
+and the training pipeline (M6 codecs beyond the current vertical slice, M7
+compile/artifact modes).
 
 Reading note
 
@@ -259,19 +263,23 @@ KV-cached call-patch generation with cross-layer KV sharing — complete:
 * `supports_kquant_cached_custom_ffn` no longer rejects architectures with
   `kv_shared_source_layer`.
 
-Fused GPU `prefill_kquant` with call patches — complete (prefill only):
+Fused GPU prefill + decode with call patches — complete:
 
-* Metal `dispatch_full_pipeline` accepts `post_ffn_fn` (per-layer CPU hook after
-  dense FFN, same commit pattern as hybrid MoE).
-* `MetalBackend::prefill_kquant_with_post_ffn_fn` runs fused prefill with the hook.
-* `fused_prefill_with_call_patches` / `supports_fused_prefill_with_call_patches`
-  apply Monty call patches via `WalkFfn::apply_call_patches_to_buffers` on GPU
-  readback (requires `gpu` feature + Metal backend).
+* Metal `decode_token_with_moe_split_fn` accepts `post_ffn_fn` (per-layer CPU
+  hook after dense FFN, same commit pattern as prefill / hybrid MoE).
+* `MetalBackend::decode_kquant_with_post_ffn_fn` runs fused decode with the hook.
+* `fused_decode_step_with_call_patches` applies Monty call patches via
+  `WalkFfn::apply_call_patches_to_buffers` on GPU readback (requires `gpu`
+  feature + Metal backend + prior fused prefill on the same backend).
+* `generate_with_call_patches_runner` routes through the fused GPU path when
+  `supports_fused_prefill_with_call_patches` holds and a `backend` is supplied,
+  otherwise falls back to the CPU Q4K cached driver or generic KV layer loop.
 
 Still incomplete:
 
-* Fused GPU `decode_token` with call patches (decode steps in
-  `generate_with_call_patches` still use the CPU Q4K cached driver).
+* M6 learned linear codec artifact format.
+* M7 compile/artifact strict modes (partially done).
+* Training prototype (M8+).
 
 ⸻
 
