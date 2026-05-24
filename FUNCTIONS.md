@@ -73,14 +73,11 @@ Still remaining
     * batched prefill and generation loop integration
 * Expand inline LQL beyond the current file-backed/gate-code vertical slice if
   richer `INPUT (...)`, `OUTPUT (...)`, and policy grammar proves necessary.
-* Harden runtime policy:
-    * cooldowns and per-sequence budgets
-    * end-to-end timeout/memory limits using Monty resource tracking
-    * trace/metrics surfacing through public inference APIs
-    * false-fire and residual-explosion tests
-* Benchmark the no-call, loaded-but-not-fired, and fired-call paths.
 * Build the codec roadmap beyond the current raw residual / top-k basis /
-  sparse basis delta / sparse logit-bias support.
+  sparse basis delta / sparse logit-bias support (M6: learned linear codec
+  artifact format).
+* M7: `COMPILE INTO MODEL` hard rejection; `COMPILE INTO VINDEX` strict /
+  runtime-sidecar modes; docs and examples.
 * Implement the training prototype and later research-grade training loop.
 
 Recommended next milestone
@@ -148,7 +145,7 @@ Locally confirmed in this repository since the original plan was written:
 * `ATTACH CALL` executor tests live in
   [crates/larql-lql/src/executor/tests.rs](crates/larql-lql/src/executor/tests.rs).
 
-Recently completed (M5 safety hardening, partial):
+M5 safety hardening — complete:
 
 * `MontyCallRuntime` now enforces `max_calls_per_sequence` and
   `cooldown_tokens` from `CallTrigger` — both fields were previously defined
@@ -162,14 +159,21 @@ Recently completed (M5 safety hardening, partial):
 * New tests: sequence budget enforcement, budget reset, cooldown enforcement,
   trace event emission (Fired / SkippedTrigger / SkippedSequenceBudget /
   SkippedCooldown), drain semantics, tracing-disabled no-op.
+* False-fire safety tests: score threshold, margin threshold, rank guard,
+  per-token budget, zero-output policy on decode error.
+* Residual-explosion safety tests: clamp to configured norm, direction
+  preservation, zero-limit nullification, within-limit pass-through,
+  end-to-end runtime clamp.
+* Criterion bench suite at `crates/larql-inference/benches/monty_call.rs`:
+  `walk_ffn_call_paths/{no_calls,loaded_not_fired,one_call_per_token}`,
+  `encoder_raw_vs_topk/{raw_f32,topk_basis}` at multiple hidden sizes,
+  `monty_call_runtime/{in_process_runner,skipped_trigger}`.
 
 Still incomplete:
 
 * Dense/static FFN paths, Metal/GPU paths, full mmap/kquant paths, and batched
   prefill/generation loop integration — call patches only execute on the
   sparse CPU `WalkFfn` path today.
-* False-fire and residual-explosion tests (residual clamping is already
-  tested; dedicated named tests for these safety scenarios are not yet written).
 
 ⸻
 

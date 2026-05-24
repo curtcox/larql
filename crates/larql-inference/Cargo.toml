@@ -125,3 +125,7 @@ larql-kv = { path = "../larql-kv" }
 [[bench]]
 name = "wire_codec"
 harness = false
+
+[[bench]]
+name = "monty_call"
+harness = false
