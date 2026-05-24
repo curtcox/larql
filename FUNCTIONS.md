@@ -46,6 +46,10 @@ Already implemented in-tree
       implements trigger checks, JSON input encoding, output decoding, residual
       clamping, sparse logit-bias decoding, metrics, and
       `MontyCallRuntime<R: CallProgramRunner>`.
+    * `MontyVmRunner` executes call patch code through the `pydantic_monty`
+      Python package, with `LARQL_MONTY_PYTHON` selecting the interpreter when
+      needed. The unit smoke test runs when `pydantic_monty` is importable and
+      skips cleanly otherwise.
     * `WalkFfn` has opt-in `with_call_patches(...)` and
       `with_call_runtime(...)` hooks. Selected call features are looked up
       after gate selection, executed through the installed runtime, and skipped
@@ -53,9 +57,6 @@ Already implemented in-tree
 
 Still remaining
 
-* Wire a concrete Monty VM-backed `CallProgramRunner` into
-  `larql-inference`. The current runtime is injectable/testable, but stops at
-  the deterministic boundary around the call.
 * Extend execution beyond the sparse CPU `WalkFfn` path:
     * dense/static FFN paths
     * Metal/GPU paths
@@ -75,11 +76,10 @@ Still remaining
 
 Recommended next milestone
 
-The next highest-leverage step is a concrete Monty VM runner behind
-`CallProgramRunner`, then one end-to-end synthetic test where a file-backed
-call patch fires inside sparse CPU `WalkFfn`, returns a bounded residual delta,
-and changes the expected next-token logits while the no-call and non-fired
-paths remain unchanged.
+The next highest-leverage step is an end-to-end synthetic test where a
+file-backed call patch fires inside sparse CPU `WalkFfn`, returns a bounded
+residual delta through `MontyVmRunner`, and changes the expected next-token
+logits while the no-call and non-fired paths remain unchanged.
 
 Reading note
 
@@ -142,8 +142,6 @@ Locally confirmed in this repository since the original plan was written:
 
 Still incomplete:
 
-* Concrete Monty VM execution from `larql-inference`; only the runner trait and
-  deterministic runtime boundary are implemented.
 * Production API surface for exposing call metrics/traces to callers.
 
 ⸻

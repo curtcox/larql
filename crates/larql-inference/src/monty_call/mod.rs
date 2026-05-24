@@ -1083,6 +1083,7 @@ mod tests {
         let mut call = call();
         call.trigger.score_threshold = None;
         call.trigger.margin_threshold = None;
+        call.limits.time_us = 1_000_000;
         call.safety.failure_policy = "zero_output_and_log".into();
         let ctx = CallContext {
             layer: 2,
@@ -1302,5 +1303,34 @@ mod tests {
             matches!(err, Err(CallError::ProgramRun(_))),
             "expected ProgramRun for missing interpreter, got {err:?}"
         );
+    }
+
+    #[test]
+    fn monty_vm_runner_executes_pydantic_monty_when_available() {
+        let python = std::env::var("LARQL_MONTY_PYTHON").unwrap_or_else(|_| "python3".into());
+        let available = std::process::Command::new(&python)
+            .arg("-c")
+            .arg("import pydantic_monty")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !available {
+            eprintln!("skipping Monty VM smoke test; pydantic_monty is not importable");
+            return;
+        }
+
+        let mut call = call();
+        call.monty_code =
+            "def main(input):\n    return {'residual_delta': [x * 2 for x in input['residual']]}\n"
+                .into();
+        let mut runner = MontyVmRunner::with_python(python);
+
+        let output = runner
+            .run(&call, json!({"residual": [1.0, -2.0, 0.5]}))
+            .expect("pydantic_monty should execute the call patch");
+
+        assert_eq!(output, json!({"residual_delta": [2.0, -4.0, 1.0]}));
     }
 }
