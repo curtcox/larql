@@ -225,11 +225,34 @@ print(json.dumps(asyncio.run(_run()), separators=(",", ":")))
 
 pub trait CallPatchLookup {
     fn call_patch(&self, layer: usize, feature: usize) -> Option<&CallPatchOp>;
+    /// All call patches on `layer`, each paired with its gate vector.
+    ///
+    /// Used by dense-path walk kernels (full_mmap, interleaved, kquant_native,
+    /// etc.) that don't run gate KNN and therefore can't discover call patches
+    /// via the sparse per-feature loop. Each entry is
+    /// `(feature_index, call_op, gate_vector)`.
+    fn call_patches_for_layer_with_gates(
+        &self,
+        layer: usize,
+    ) -> Vec<(usize, &CallPatchOp, &[f32])>;
 }
 
 impl CallPatchLookup for larql_vindex::PatchedVindex {
     fn call_patch(&self, layer: usize, feature: usize) -> Option<&CallPatchOp> {
         self.call_patch(layer, feature)
+    }
+
+    fn call_patches_for_layer_with_gates(
+        &self,
+        layer: usize,
+    ) -> Vec<(usize, &CallPatchOp, &[f32])> {
+        self.call_patches_for_layer(layer)
+            .into_iter()
+            .filter_map(|call| {
+                let gate = self.overrides_gate_at(layer, call.feature)?;
+                Some((call.feature, call, gate))
+            })
+            .collect()
     }
 }
 

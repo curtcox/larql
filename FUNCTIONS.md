@@ -8,10 +8,14 @@ This document is now split into two readings:
   file-backed attach flow, an opt-in inference-side execution seam for
   call patches, a public inference entry point (`predict_with_call_patches` /
   `predict_with_call_patches_runner`) that surfaces call metrics and per-event
-  trace events, and M5 safety hardening.
-* **Remaining**: broader inference-path coverage beyond the sparse CPU
-  `WalkFfn` path, generation-loop integration, production safety hardening,
-  benchmarks, and the training pipeline.
+  trace events, M5 safety hardening, multi-token generation with call patches,
+  and dense-path call patch wiring (full_mmap, interleaved, kquant_native,
+  kquant_dequant, exact, and weights_fallback paths now support call patches
+  via the `apply_call_patches_dense` post-processing step).
+* **Remaining**: Metal/GPU path wiring, full mmap/kquant paths where
+  applicable (already done for CPU paths), batched prefill/generation loop
+  integration, production safety hardening, benchmarks, and the training
+  pipeline.
 
 Already implemented in-tree
 
@@ -195,11 +199,29 @@ Public observability entry point — complete:
 * Tests: `predict_with_call_patches_runner_exposes_metrics` (no trace),
   `predict_with_call_patches_runner_collects_trace_when_enabled` (Fired event).
 
+Dense CPU path wiring — complete:
+
+* `CallPatchLookup` gained `call_patches_for_layer_with_gates(layer)` returning
+  `Vec<(feature, &CallPatchOp, &[f32])>` — needed by dense paths that don't
+  run gate KNN.
+* `WalkFfn::apply_call_patches_dense(layer, x, out)` post-processes any dense
+  FFN output: iterates all call patches for the layer, scores each against the
+  current residual, ranks by descending score, and executes patches that pass
+  trigger thresholds.
+* Wired into every remaining CPU walk path: `full_mmap`, `interleaved`,
+  `interleaved_kquant:native`, `interleaved_kquant:dequant`, `exact`, and
+  `weights_fallback` (the fallback path also filters call-patch features from
+  the static sparse matmul to prevent incorrect FFN row reads).
+* New tests: `apply_call_patches_dense_fires_and_adds_delta`,
+  `apply_call_patches_dense_no_op_without_patches`,
+  `apply_call_patches_dense_no_op_without_runtime`,
+  `apply_call_patches_dense_respects_score_threshold`.
+
 Still incomplete:
 
-* Dense/static FFN paths, Metal/GPU paths, full mmap/kquant paths, and batched
-  prefill/generation loop integration — call patches only execute on the
-  sparse CPU `WalkFfn` path today.
+* Metal/GPU paths — deferred per the CPU-first policy from the plan.
+* KV-cached decode loop — not yet wired.
+* Batched prefill integration beyond the current O(N²) loop.
 
 ⸻
 

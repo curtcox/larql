@@ -83,8 +83,9 @@ impl<'a> WalkFfn<'a> {
         let down_flat =
             self.index
                 .kquant_matmul_transb(layer, 2, act_flat, seq_len, self.backend)?;
-        let out = Array2::from_shape_vec((seq_len, hidden), down_flat).ok()?;
+        let mut out = Array2::from_shape_vec((seq_len, hidden), down_flat).ok()?;
 
+        self.apply_call_patches_dense(layer, x, &mut out);
         self.trace_path(layer, "interleaved_kquant:native");
         Some((out, activation))
     }

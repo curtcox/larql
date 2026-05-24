@@ -310,6 +310,106 @@ impl<'a> WalkFfn<'a> {
     }
 }
 
+impl<'a> WalkFfn<'a> {
+    /// Apply call patches to a dense FFN output in-place.
+    ///
+    /// Dense paths (full_mmap, interleaved, kquant_native, etc.) skip the
+    /// per-feature gate KNN loop, so call patches never get a chance to fire
+    /// via the sparse path. This helper bridges the gap: it iterates over all
+    /// call patches registered on `layer`, computes each patch's gate score
+    /// against `x`, and executes any that pass their trigger thresholds.
+    ///
+    /// Ranks are assigned among call patches sorted by descending score for each
+    /// position, so `require_top_k = 1` (the default) fires only the
+    /// highest-scoring call patch per position.
+    pub(super) fn apply_call_patches_dense(
+        &self,
+        layer: usize,
+        x: &Array2<f32>,
+        out: &mut Array2<f32>,
+    ) {
+        let patches = match self.call_patches {
+            Some(p) => p,
+            None => return,
+        };
+        let runtime = match self.call_runtime {
+            Some(r) => r,
+            None => return,
+        };
+
+        let layer_patches = patches.call_patches_for_layer_with_gates(layer);
+        if layer_patches.is_empty() {
+            return;
+        }
+
+        let seq_len = x.shape()[0];
+        let hidden = x.shape()[1];
+
+        for s in 0..seq_len {
+            let x_row = x.row(s);
+            let x_slice: &[f32] = if let Some(sl) = x_row.as_slice() {
+                sl
+            } else {
+                // Non-contiguous row — skip; this is a correctness
+                // guard, not a hot path.
+                continue;
+            };
+
+            // Score every call patch for this position, then rank by score.
+            let mut scored: Vec<(usize, f32)> = layer_patches
+                .iter()
+                .map(|(feat, _, gate)| {
+                    let score: f32 = gate.iter().zip(x_slice.iter()).map(|(a, b)| a * b).sum();
+                    (*feat, score)
+                })
+                .collect();
+            scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut calls_fired_this_position: usize = 0;
+            for (rank_idx, (feat, score)) in scored.iter().enumerate() {
+                // Find the call op for this feature.
+                let call = match layer_patches.iter().find(|(f, _, _)| f == feat) {
+                    Some((_, c, _)) => *c,
+                    None => continue,
+                };
+
+                let margin = if rank_idx + 1 < scored.len() {
+                    Some(score - scored[rank_idx + 1].1)
+                } else {
+                    None
+                };
+
+                let ctx = crate::monty_call::CallContext {
+                    layer,
+                    position: s,
+                    residual: x_slice,
+                    token_ids: &[],
+                    token_text: None,
+                };
+                if let Ok(Some(call_output)) = runtime.execute_call(
+                    call,
+                    crate::monty_call::CallCandidate {
+                        rank: rank_idx + 1,
+                        score: *score,
+                        margin,
+                        calls_already_fired: calls_fired_this_position,
+                    },
+                    &ctx,
+                    hidden,
+                ) {
+                    calls_fired_this_position += 1;
+                    if let Some(delta) = call_output.residual_delta {
+                        if delta.len() == hidden {
+                            out.row_mut(s)
+                                .scaled_add(1.0, &ndarray::ArrayView1::from(delta.as_slice()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl<'a> FfnBackend for WalkFfn<'a> {
     fn forward(&self, layer: usize, x: &Array2<f32>) -> Array2<f32> {
         self.forward_with_activation(layer, x).0
@@ -449,13 +549,29 @@ impl<'a> FfnBackend for WalkFfn<'a> {
             //     (extract_level = Browse without pinned weights).
             let top_k = self.top_k_for(layer);
             let features = self.index.gate_knn_batch(layer, x, top_k);
-            let has_any_override = features.iter().any(|&f| {
+            // Exclude call-patch features from the static sparse matmul —
+            // they have no down_meta in the safetensors weights and must
+            // be handled separately via apply_call_patches_dense below.
+            let static_features: Vec<usize> = if self.call_patches.is_some() {
+                features
+                    .iter()
+                    .copied()
+                    .filter(|&f| {
+                        self.call_patches
+                            .map(|p| p.call_patch(layer, f).is_none())
+                            .unwrap_or(true)
+                    })
+                    .collect()
+            } else {
+                features.clone()
+            };
+            let has_any_override = static_features.iter().any(|&f| {
                 self.index.down_override(layer, f).is_some()
                     || self.index.up_override(layer, f).is_some()
             }) || self.index.has_overrides_at(layer);
 
-            if has_any_override {
-                let slot_overrides: Vec<crate::ffn::FeatureSlotOverride<'_>> = features
+            let mut fb_result = if has_any_override {
+                let slot_overrides: Vec<crate::ffn::FeatureSlotOverride<'_>> = static_features
                     .iter()
                     .map(|&f| crate::ffn::FeatureSlotOverride {
                         feature: f,
@@ -466,16 +582,19 @@ impl<'a> FfnBackend for WalkFfn<'a> {
                     .filter(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some())
                     .collect();
                 self.trace_path(layer, "weights_fallback:override");
-                break 'routing crate::ffn::sparse_ffn_forward_with_full_overrides(
+                crate::ffn::sparse_ffn_forward_with_full_overrides(
                     self.weights,
                     layer,
                     x,
-                    &features,
+                    &static_features,
                     &slot_overrides,
-                );
-            }
-            self.trace_path(layer, "weights_fallback:sparse");
-            break 'routing sparse_ffn_forward(self.weights, layer, x, &features);
+                )
+            } else {
+                self.trace_path(layer, "weights_fallback:sparse");
+                sparse_ffn_forward(self.weights, layer, x, &static_features)
+            };
+            self.apply_call_patches_dense(layer, x, &mut fb_result.0);
+            break 'routing fb_result;
         };
 
         if let Some(key) = l1_key {
@@ -930,5 +1049,176 @@ mod dispatch_tests {
         let out = ffn.forward(0, &x);
         assert_eq!(out.shape(), &[1, weights.hidden_size]);
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    // ── Dense-path call patch tests ───────────────────────────────────────────
+
+    use crate::monty_call::{CallError, CallProgramRunner};
+    use larql_vindex::{CallPatchOp, CallResourceLimits, CallSafetyPolicy, CallTrigger};
+    use serde_json::{json, Value};
+    use std::cell::RefCell;
+
+    struct DeltaRunner {
+        hidden: usize,
+    }
+
+    impl CallProgramRunner for DeltaRunner {
+        fn run(&mut self, _call: &CallPatchOp, _input: Value) -> Result<Value, CallError> {
+            Ok(json!({"residual_delta": vec![1.0f32; self.hidden]}))
+        }
+    }
+
+    /// apply_call_patches_dense fires on a matching residual and adds the
+    /// delta to out. The gate vector is the input itself scaled up so it
+    /// scores very high, the delta is [1.0; hidden].
+    #[test]
+    fn apply_call_patches_dense_fires_and_adds_delta() {
+        use crate::monty_call::MontyCallRuntime;
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        use crate::test_utils::{make_test_vindex, make_test_weights};
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        let x_row = (0..hidden).map(|i| (i as f32 + 1.0) * 0.02).collect::<Vec<_>>();
+        // Gate vector is x_row * 100 so dot(gate, x) >> any base feature.
+        let gate_vec: Vec<f32> = x_row.iter().map(|v| v * 100.0).collect();
+        patched.insert_call_patch(
+            CallPatchOp {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: Value::Null,
+                output_schema: Value::Null,
+                trigger: CallTrigger::default(),
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy::default(),
+                metadata: Value::Null,
+            },
+            gate_vec,
+        );
+        let runtime = RefCell::new(MontyCallRuntime::new(DeltaRunner { hidden }));
+        let ffn = WalkFfn::from_config(
+            &weights,
+            &patched,
+            WalkFfnConfig::sparse(weights.num_layers, 1),
+        )
+        .with_call_patches(&patched)
+        .with_call_runtime(&runtime);
+
+        let x = Array2::from_shape_vec(
+            (1, hidden),
+            x_row.clone(),
+        )
+        .unwrap();
+        let mut out = Array2::<f32>::zeros((1, hidden));
+        ffn.apply_call_patches_dense(0, &x, &mut out);
+
+        assert_eq!(runtime.borrow().metrics().fired, 1);
+        // Delta [1.0; hidden] was added to the zero output.
+        assert_eq!(out.row(0).to_vec(), vec![1.0f32; hidden]);
+    }
+
+    /// apply_call_patches_dense is a no-op when call_patches is None.
+    #[test]
+    fn apply_call_patches_dense_no_op_without_patches() {
+        let weights = make_test_weights();
+        let idx = mock_index(&weights);
+        let hidden = weights.hidden_size;
+        let ffn = WalkFfn::new_unlimited(&weights, &idx);
+        let x = input(1, hidden);
+        let mut out = Array2::<f32>::zeros((1, hidden));
+        ffn.apply_call_patches_dense(0, &x, &mut out); // should not panic
+        assert!(out.iter().all(|v| *v == 0.0), "no delta expected");
+    }
+
+    /// apply_call_patches_dense is a no-op when call_runtime is None even if
+    /// call_patches is set.
+    #[test]
+    fn apply_call_patches_dense_no_op_without_runtime() {
+        use crate::test_utils::{attach_feature_major_f32_to_test_vindex, make_test_vindex};
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let x_row: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.02).collect();
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        patched.insert_call_patch(
+            CallPatchOp {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: Value::Null,
+                output_schema: Value::Null,
+                trigger: CallTrigger::default(),
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy::default(),
+                metadata: Value::Null,
+            },
+            x_row.iter().map(|v| v * 100.0).collect(),
+        );
+        let ffn = WalkFfn::from_config(
+            &weights,
+            &patched,
+            WalkFfnConfig::sparse(weights.num_layers, 1),
+        )
+        .with_call_patches(&patched); // no call_runtime
+
+        let x = Array2::from_shape_vec((1, hidden), x_row).unwrap();
+        let mut out = Array2::<f32>::zeros((1, hidden));
+        ffn.apply_call_patches_dense(0, &x, &mut out);
+        assert!(out.iter().all(|v| *v == 0.0), "no delta expected without runtime");
+    }
+
+    /// A call patch with score_threshold = f32::MAX never fires on dense path.
+    #[test]
+    fn apply_call_patches_dense_respects_score_threshold() {
+        use crate::monty_call::MontyCallRuntime;
+        use crate::test_utils::{attach_feature_major_f32_to_test_vindex, make_test_vindex};
+        let weights = make_test_weights();
+        let mut base = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut base);
+        let hidden = weights.hidden_size;
+        let x_row: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.02).collect();
+        let mut patched = larql_vindex::PatchedVindex::new(base);
+        let mut trigger = CallTrigger::default();
+        trigger.score_threshold = Some(f32::MAX);
+        patched.insert_call_patch(
+            CallPatchOp {
+                layer: 0,
+                feature: 0,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: Value::Null,
+                output_schema: Value::Null,
+                trigger,
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy::default(),
+                metadata: Value::Null,
+            },
+            x_row.iter().map(|v| v * 100.0).collect(),
+        );
+        let runtime = RefCell::new(MontyCallRuntime::new(DeltaRunner { hidden }));
+        let ffn = WalkFfn::from_config(
+            &weights,
+            &patched,
+            WalkFfnConfig::sparse(weights.num_layers, 1),
+        )
+        .with_call_patches(&patched)
+        .with_call_runtime(&runtime);
+
+        let x = Array2::from_shape_vec((1, hidden), x_row).unwrap();
+        let mut out = Array2::<f32>::zeros((1, hidden));
+        ffn.apply_call_patches_dense(0, &x, &mut out);
+
+        assert_eq!(runtime.borrow().metrics().fired, 0);
+        assert_eq!(runtime.borrow().metrics().skipped, 1);
+        assert!(out.iter().all(|v| *v == 0.0));
     }
 }

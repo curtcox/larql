@@ -51,7 +51,8 @@ impl<'a> WalkFfn<'a> {
         } else {
             crate::ffn::silu_gate_up(&gate, &up)
         };
-        let out = crate::forward::dot_proj(&activation, &w_down);
+        let mut out = crate::forward::dot_proj(&activation, &w_down);
+        self.apply_call_patches_dense(layer, x, &mut out);
         self.trace_path(layer, "interleaved_kquant:dequant");
         Some((out, activation))
     }
