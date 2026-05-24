@@ -4988,3 +4988,246 @@ fn compact_major_skips_inserts_with_no_relation() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── ATTACH CALL tests ──────────────────────────────────────────────────────
+
+fn write_call_patch_json(dir: &std::path::Path, gate: &[f32]) -> std::path::PathBuf {
+    let gate_b64 = larql_vindex::patch::core::encode_gate_vector(gate);
+    let json = serde_json::json!({
+        "op": "call",
+        "layer": 0,
+        "feature": 1,
+        "gate_vector_b64": gate_b64,
+        "monty_code": "def main(input):\n    return input\n",
+        "trigger": {"score_threshold": null, "max_calls_per_token": 1, "require_top_k": 1},
+        "limits": {"time_us": 250, "memory_bytes": 1048576, "steps": 10000},
+        "safety": {}
+    });
+    let path = dir.join("call_patch.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn attach_call_from_file_registers_call_patch() {
+    let (mut session, dir) = vindex_session("attach_call_registers");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+    let patch_path = write_call_patch_json(&dir, &gate);
+
+    let stmt = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&patch_path)
+    ))
+    .unwrap();
+    let out = session.execute(&stmt).expect("ATTACH CALL should succeed");
+    let joined = out.join("\n");
+    assert!(
+        joined.contains("L0") && joined.contains("F1"),
+        "expected L0 F1 in output: {joined}"
+    );
+
+    let overlay = session.patched_overlay_mut().expect("vindex backend");
+    assert!(
+        overlay.call_patch(0, 1).is_some(),
+        "call patch should be registered at L0 F1"
+    );
+    assert!(
+        overlay.overrides_gate_at(0, 1).is_some(),
+        "gate vector should be registered for the call slot"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_call_adds_op_to_recording_when_active() {
+    let (mut session, dir) = vindex_session("attach_call_recording");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+    let patch_path = write_call_patch_json(&dir, &gate);
+
+    let begin = parser::parse(r#"BEGIN PATCH "ops.vlp";"#).unwrap();
+    session.execute(&begin).expect("BEGIN PATCH");
+
+    let attach = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&patch_path)
+    ))
+    .unwrap();
+    session.execute(&attach).expect("ATTACH CALL");
+
+    let recording = session.patch_recording.as_ref().expect("recording active");
+    assert_eq!(recording.operations.len(), 1);
+    assert!(
+        matches!(recording.operations[0], larql_vindex::PatchOp::Call(_)),
+        "recording should contain a Call op"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_call_show_patches_counts_call() {
+    let (mut session, dir) = vindex_session("attach_call_show");
+    let gate = vec![0.5f32, 0.5, 0.0, 0.0];
+    let patch_path = write_call_patch_json(&dir, &gate);
+
+    let attach = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&patch_path)
+    ))
+    .unwrap();
+    session.execute(&attach).expect("ATTACH CALL");
+
+    // Gate vector was registered → overlay has 1 override.
+    let overlay = session.patched_overlay_mut().expect("vindex backend");
+    assert_eq!(overlay.call_patches_for_layer(0).len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_call_missing_file_returns_error() {
+    let (mut session, dir) = vindex_session("attach_call_missing");
+    let stmt = parser::parse(r#"ATTACH CALL FROM FILE "/nonexistent/call.json";"#).unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(
+        matches!(err, LqlError::Execution(_)),
+        "missing file should return Execution error: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_call_missing_gate_vector_returns_error() {
+    let (mut session, dir) = vindex_session("attach_call_no_gate");
+    let json = serde_json::json!({
+        "op": "call",
+        "layer": 0,
+        "feature": 1,
+        "monty_code": "def main(input):\n    return input\n",
+    });
+    let path = dir.join("call_no_gate.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+    let stmt = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&path)
+    ))
+    .unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(
+        matches!(err, LqlError::Execution(_)),
+        "missing gate_vector_b64 should return Execution error: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_call_save_patch_writes_call_op() {
+    let (mut session, dir) = vindex_session("attach_call_save");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+    let patch_path = write_call_patch_json(&dir, &gate);
+
+    let begin = parser::parse(&format!(r#"BEGIN PATCH "{}";"#, lql_path(&dir.join("out.vlp"))))
+        .unwrap();
+    session.execute(&begin).expect("BEGIN PATCH");
+
+    let attach = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&patch_path)
+    ))
+    .unwrap();
+    session.execute(&attach).expect("ATTACH CALL");
+
+    let save = parser::parse("SAVE PATCH;").unwrap();
+    session.execute(&save).expect("SAVE PATCH");
+
+    let saved = larql_vindex::VindexPatch::load(&dir.join("out.vlp")).expect("load saved patch");
+    assert_eq!(saved.operations.len(), 1);
+    assert!(
+        matches!(saved.operations[0], larql_vindex::PatchOp::Call(_)),
+        "saved patch should contain a Call op"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_call_apply_patch_rehydrates_call() {
+    let (mut session, dir) = vindex_session("attach_call_apply");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+
+    // Write a .vlp containing a Call op directly.
+    let gate_b64 = larql_vindex::patch::core::encode_gate_vector(&gate);
+    let vlp = larql_vindex::VindexPatch {
+        version: 1,
+        base_model: "test".into(),
+        base_checksum: None,
+        created_at: "2026-01-01".into(),
+        description: None,
+        author: None,
+        tags: vec![],
+        operations: vec![larql_vindex::PatchOp::Call(larql_vindex::CallPatchOp {
+            layer: 0,
+            feature: 2,
+            gate_vector_b64: Some(gate_b64),
+            monty_code: "def main(input):\n    return input\n".into(),
+            code_hash: None,
+            input_schema: serde_json::Value::Null,
+            output_schema: serde_json::Value::Null,
+            trigger: larql_vindex::CallTrigger::default(),
+            limits: larql_vindex::CallResourceLimits::default(),
+            safety: larql_vindex::CallSafetyPolicy::default(),
+            metadata: serde_json::Value::Null,
+        })],
+    };
+    let vlp_path = dir.join("call.vlp");
+    vlp.save(&vlp_path).expect("save vlp");
+
+    let apply = parser::parse(&format!(
+        r#"APPLY PATCH "{}";"#,
+        lql_path(&vlp_path)
+    ))
+    .unwrap();
+    session.execute(&apply).expect("APPLY PATCH");
+
+    let overlay = session.patched_overlay_mut().expect("vindex backend");
+    assert!(
+        overlay.call_patch(0, 2).is_some(),
+        "APPLY PATCH should rehydrate the call patch at L0 F2"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_into_model_with_call_patch_returns_error() {
+    let (mut session, dir) = vindex_session("compile_model_call_reject");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+    let patch_path = write_call_patch_json(&dir, &gate);
+
+    let begin = parser::parse(&format!(r#"BEGIN PATCH "{}";"#, lql_path(&dir.join("x.vlp"))))
+        .unwrap();
+    session.execute(&begin).expect("BEGIN PATCH");
+
+    let attach = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&patch_path)
+    ))
+    .unwrap();
+    session.execute(&attach).expect("ATTACH CALL");
+
+    let out_path = dir.join("compiled.safetensors");
+    let stmt = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO MODEL "{}";"#,
+        lql_path(&out_path)
+    ))
+    .unwrap();
+    let err = session.execute(&stmt).unwrap_err();
+    assert!(
+        matches!(err, LqlError::Execution(_)),
+        "COMPILE INTO MODEL with call patch should fail: {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

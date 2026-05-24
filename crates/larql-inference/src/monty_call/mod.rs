@@ -33,6 +33,9 @@ pub struct CallCandidate {
     pub rank: usize,
     pub score: f32,
     pub margin: Option<f32>,
+    /// How many call patches have already fired for this token position.
+    /// Checked against `CallTrigger::max_calls_per_token` before executing.
+    pub calls_already_fired: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -166,6 +169,11 @@ pub fn should_fire(trigger: &CallTrigger, candidate: CallCandidate) -> bool {
     if candidate.rank == 0 || candidate.rank > trigger.require_top_k {
         return false;
     }
+    if trigger.max_calls_per_token == 0
+        || candidate.calls_already_fired >= trigger.max_calls_per_token
+    {
+        return false;
+    }
     if let Some(threshold) = trigger.score_threshold {
         if candidate.score.abs() < threshold {
             return false;
@@ -176,7 +184,7 @@ pub fn should_fire(trigger: &CallTrigger, candidate: CallCandidate) -> bool {
             return false;
         }
     }
-    trigger.max_calls_per_token > 0
+    true
 }
 
 pub fn encode_input(call: &CallPatchOp, ctx: &CallContext<'_>) -> Value {
@@ -365,6 +373,7 @@ mod tests {
                 rank: 1,
                 score: -3.5,
                 margin: Some(0.6),
+                calls_already_fired: 0,
             },
         ));
         assert!(!should_fire(
@@ -373,6 +382,7 @@ mod tests {
                 rank: 3,
                 score: 9.0,
                 margin: Some(9.0),
+                calls_already_fired: 0,
             },
         ));
         assert!(!should_fire(
@@ -381,6 +391,7 @@ mod tests {
                 rank: 1,
                 score: 2.0,
                 margin: Some(9.0),
+                calls_already_fired: 0,
             },
         ));
         assert!(!should_fire(
@@ -389,6 +400,7 @@ mod tests {
                 rank: 1,
                 score: 9.0,
                 margin: Some(0.1),
+                calls_already_fired: 0,
             },
         ));
     }
@@ -482,6 +494,7 @@ mod tests {
                     rank: 1,
                     score: 3.5,
                     margin: Some(0.6),
+                    calls_already_fired: 0,
                 },
                 &ctx,
                 3,
@@ -516,6 +529,7 @@ mod tests {
                     rank: 99,
                     score: 100.0,
                     margin: Some(100.0),
+                    calls_already_fired: 0,
                 },
                 &ctx,
                 3,
@@ -526,5 +540,54 @@ mod tests {
         assert_eq!(runtime.metrics().attempted, 1);
         assert_eq!(runtime.metrics().skipped, 1);
         assert_eq!(runtime.metrics().fired, 0);
+    }
+
+    #[test]
+    fn should_fire_blocked_when_budget_exhausted() {
+        let trigger = call().trigger; // max_calls_per_token = 2
+        let mut t = call().trigger;
+        t.score_threshold = None;
+        t.margin_threshold = None;
+        t.max_calls_per_token = 2;
+        t.require_top_k = 10;
+        assert!(should_fire(
+            &t,
+            CallCandidate {
+                rank: 1,
+                score: 1.0,
+                margin: None,
+                calls_already_fired: 0,
+            }
+        ));
+        assert!(should_fire(
+            &t,
+            CallCandidate {
+                rank: 2,
+                score: 1.0,
+                margin: None,
+                calls_already_fired: 1,
+            }
+        ));
+        assert!(!should_fire(
+            &t,
+            CallCandidate {
+                rank: 3,
+                score: 1.0,
+                margin: None,
+                calls_already_fired: 2,
+            }
+        ));
+        // max_calls_per_token = 0 always blocks
+        t.max_calls_per_token = 0;
+        assert!(!should_fire(
+            &t,
+            CallCandidate {
+                rank: 1,
+                score: 1.0,
+                margin: None,
+                calls_already_fired: 0,
+            }
+        ));
+        drop(trigger);
     }
 }

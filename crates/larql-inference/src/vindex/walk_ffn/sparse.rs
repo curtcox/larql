@@ -277,6 +277,10 @@ impl<'a> WalkFfn<'a> {
                 }
             }
 
+            // Counts call patches that fired for this position; enforces
+            // per-token budgets defined in each call's trigger.
+            let mut calls_fired_this_position: usize = 0;
+
             // Serial per-feature loop — the correctness baseline.
             for (rank_idx, (feat, gate_score)) in hits.into_iter().enumerate() {
                 if let Some(call) = self
@@ -297,10 +301,12 @@ impl<'a> WalkFfn<'a> {
                                 rank: rank_idx + 1,
                                 score: gate_score,
                                 margin: margins.get(rank_idx).copied(),
+                                calls_already_fired: calls_fired_this_position,
                             },
                             &ctx,
                             hidden,
                         ) {
+                            calls_fired_this_position += 1;
                             if let Some(delta) = call_output.residual_delta {
                                 if delta.len() == hidden {
                                     out_row += &ndarray::ArrayView1::from(delta.as_slice());
@@ -525,6 +531,10 @@ mod tests {
             },
             vec![100.0; hidden],
         );
+        // Default trigger has max_calls_per_token=1 and require_top_k=1,
+        // score_threshold=None. The gate vector [100.0; hidden] scores
+        // far above any base feature for input [1.0; hidden], so this
+        // call lands at rank 1 and fires once (calls_already_fired=0).
         let runtime = RefCell::new(MontyCallRuntime::new(StaticRunner { hidden }));
         let cfg = WalkFfnConfig::sparse(weights.num_layers, 1);
         let ffn = WalkFfn::from_config(&weights, &patched, cfg)
