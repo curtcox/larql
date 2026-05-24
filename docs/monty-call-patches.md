@@ -78,9 +78,41 @@ session, auto-starting an anonymous patch session like `INSERT` when needed.
 
 `COMPILE INTO MODEL` rejects runtime call patches. `COMPILE INTO VINDEX`
 bakes static patch material into the output vindex and writes runtime call
-patches to `runtime_patches.vlp` as an explicit sidecar. This prevents
-producing artifacts that appear self-contained while silently dropping runtime
-behavior.
+patches to `runtime_patches.vlp` as an explicit sidecar. `STATIC_ONLY` rejects
+call patches instead of writing the sidecar.
+
+Fresh `USE "compiled.vindex"` auto-applies `runtime_patches.vlp` when present
+and reports the call count. A compiled vindex without the sidecar does not
+silently claim runtime call behavior.
+
+## Codec Artifacts (M6)
+
+Learned linear codecs live under `<vindex>/call_codecs/<artifact_id>.json`:
+
+```json
+{
+  "version": 1,
+  "artifact_id": "residual_compress_v1",
+  "input_dim": 2560,
+  "output_dim": 64,
+  "weights_b64": "<base64 row-major f32[output_dim × input_dim]>",
+  "bias_b64": "<optional base64 f32[output_dim]>"
+}
+```
+
+Reference a codec from input/output schema:
+
+```json
+"codec": {
+  "kind": "learned_linear",
+  "artifact_id": "residual_compress_v1",
+  "input_dim": 2560,
+  "output_dim": 64
+}
+```
+
+`USE` loads `call_codecs/` automatically. `COMPILE INTO VINDEX` copies the
+directory when present.
 
 ## Current Implementation Status
 
@@ -89,27 +121,24 @@ Implemented:
 - `.vlp` JSON round-trip for `op: "call"`.
 - `PatchedVindex` overlay storage and lookup by `(layer, feature)`.
 - Call gate vectors participate in ordinary patched `gate_knn`.
-- `ATTACH CALL FROM FILE`.
-- Explicit compile rejection.
+- `ATTACH CALL FROM FILE` and inline `ATTACH CALL ... GATE VECTOR ... MONTY CODE ...`.
+- Explicit compile rejection and `runtime_patches.vlp` sidecar on `COMPILE INTO VINDEX`.
+- Fresh `USE` auto-applies the runtime sidecar.
 - Inference-side trigger evaluation, raw residual and top-k basis input
-  encoding, raw residual and sparse basis delta output decoding, residual norm
-  clamping, sparse logit-bias decoding, and an injectable
-  `MontyCallRuntime<R: CallProgramRunner>` lifecycle.
+  encoding, raw residual and sparse basis delta output decoding, learned
+  linear codec artifacts, residual norm clamping, sparse logit-bias decoding,
+  and an injectable `MontyCallRuntime<R: CallProgramRunner>` lifecycle.
 - Concrete `MontyVmRunner` execution through the `pydantic_monty` Python
   package, selected with `LARQL_MONTY_PYTHON` when a non-default interpreter is
   needed.
-- Opt-in sparse `WalkFfn` wiring for selected call patches. Call features are
-  looked up after gate selection, executed through the installed runtime, and
-  skipped as static FFN rows.
-- Dense and Metal/Q4 walk paths post-process FFN output with
-  `apply_call_patches_dense` after accelerated matmul completes.
-- Sparse full-K gemv and parallel Q4K down fast paths apply call patches per
-  position instead of bypassing the serial call loop.
+- Sparse and dense CPU walk paths, Metal/Q4/Q4K GPU paths, KV-cached generation,
+  and fused GPU prefill/decode with call patches.
 - Public helpers `predict_with_call_patches_runner` /
-  `generate_with_call_patches_runner` accept an optional GPU backend.
+  `generate_with_call_patches_runner` with optional GPU backend, trace events,
+  and codec registry.
 
 Not implemented yet:
 
-- Fused GPU `prefill_kquant` with call patches (CPU Q4K KV-cached batched prefill is wired).
-- Cross-layer KV sharing on the call-patch generation path.
-- Inline `ATTACH CALL ... INPUT ... OUTPUT ... TRIGGER ...` grammar.
+- Training-time codec learning (M8+).
+- Rich inline `INPUT (...)`, `OUTPUT (...)`, and policy grammar beyond the
+  current vertical slice.

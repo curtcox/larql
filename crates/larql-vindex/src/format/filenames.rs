@@ -109,6 +109,12 @@ pub fn layer_weights_filename(layer: usize) -> String {
     format!("layers/layer_{layer:02}.weights")
 }
 
+// ── Runtime call-patch sidecars (Monty call patches) ─────────────────
+/// Sidecar `.vlp` written by `COMPILE INTO VINDEX` for runtime call patches.
+pub const RUNTIME_PATCHES_VLP: &str = "runtime_patches.vlp";
+/// Directory of learned linear codec artifacts (`call_codecs/<id>.json`).
+pub const CALL_CODECS_DIR: &str = "call_codecs";
+
 // ── k-quant dual-read path resolution ──────────────────────────────────
 //
 // New writers emit `*_kquant.bin` filenames. Readers must accept both

@@ -11,9 +11,10 @@ use crate::executor::helpers::{dir_size, format_bytes};
 use crate::executor::tuning::{MEMIT_DEFAULT_RIDGE, MEMIT_TARGET_ALPHA};
 use crate::executor::Session;
 use larql_vindex::format::filenames::{
-    ATTN_WEIGHTS_BIN, DOWN_FEATURES_BIN, DOWN_META_BIN, DOWN_WEIGHTS_BIN, EMBEDDINGS_BIN,
-    FEATURE_CLUSTERS_JSONL, FEATURE_LABELS_JSON, KNN_STORE_BIN, NORMS_BIN, RELATION_CLUSTERS_JSON,
-    TOKENIZER_JSON, UP_FEATURES_BIN, UP_WEIGHTS_BIN, WEIGHT_MANIFEST_JSON,
+    ATTN_WEIGHTS_BIN, CALL_CODECS_DIR, DOWN_FEATURES_BIN, DOWN_META_BIN, DOWN_WEIGHTS_BIN,
+    EMBEDDINGS_BIN, FEATURE_CLUSTERS_JSONL, FEATURE_LABELS_JSON, KNN_STORE_BIN, NORMS_BIN,
+    RELATION_CLUSTERS_JSON, RUNTIME_PATCHES_VLP, TOKENIZER_JSON, UP_FEATURES_BIN, UP_WEIGHTS_BIN,
+    WEIGHT_MANIFEST_JSON,
 };
 
 use super::atomic::run_atomic_compile;
@@ -161,7 +162,7 @@ impl Session {
                 ));
             }
             // Write sidecar runtime_patches.vlp.
-            let sidecar_path = output_dir.join("runtime_patches.vlp");
+            let sidecar_path = output_dir.join(RUNTIME_PATCHES_VLP);
             let sidecar = larql_vindex::VindexPatch {
                 version: 1,
                 base_model: String::new(),
@@ -183,6 +184,23 @@ impl Session {
                 "Warning: {call_count} call patch(es) cannot be baked into static weights — written to {}",
                 sidecar_path.display()
             ));
+
+            // Copy learned codec artifacts when present so fresh USE can resolve them.
+            let src_codecs = path.join(CALL_CODECS_DIR);
+            if src_codecs.is_dir() {
+                let dst_codecs = output_dir.join(CALL_CODECS_DIR);
+                if std::fs::create_dir_all(&dst_codecs).is_ok() {
+                    if let Ok(entries) = std::fs::read_dir(&src_codecs) {
+                        for entry in entries.flatten() {
+                            let src_file = entry.path();
+                            if src_file.extension().and_then(|s| s.to_str()) == Some("json") {
+                                let dst_file = dst_codecs.join(entry.file_name());
+                                let _ = std::fs::copy(&src_file, &dst_file);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let collected = collect_memit_facts_with_recording(patched, path, &recording_ops)?;

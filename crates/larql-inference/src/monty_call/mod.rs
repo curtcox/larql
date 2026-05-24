@@ -5,6 +5,14 @@
 //! clamps. The actual Monty VM integration can sit behind this surface without
 //! changing the vindex patch format or the inference hook contract.
 
+pub mod codec;
+
+pub use codec::{
+    load_codec_registry_from_dir, save_codec_artifact, CodecError, CodecRegistry,
+    LearnedLinearCodec, LearnedLinearCodecArtifact,
+};
+
+use codec::{decode_learned_linear, encode_learned_linear};
 use larql_vindex::{
     patch::core::{decode_gate_vector, encode_gate_vector},
     CallPatchOp, CallSafetyPolicy, CallTrigger,
@@ -279,6 +287,8 @@ pub struct MontyCallRuntime<R> {
     /// Per-event trace buffer. `None` = disabled. Enable with
     /// [`with_trace_events`]; drain with [`take_trace_events`].
     trace_events: Option<Vec<CallTraceEvent>>,
+    /// Learned linear codec artifacts keyed by `artifact_id`.
+    codec_registry: Option<CodecRegistry>,
 }
 
 impl<R> MontyCallRuntime<R> {
@@ -289,6 +299,7 @@ impl<R> MontyCallRuntime<R> {
             sequence_call_counts: std::collections::HashMap::new(),
             last_fired_positions: std::collections::HashMap::new(),
             trace_events: None,
+            codec_registry: None,
         }
     }
 
@@ -304,6 +315,16 @@ impl<R> MontyCallRuntime<R> {
     pub fn with_trace_events(mut self) -> Self {
         self.trace_events = Some(Vec::new());
         self
+    }
+
+    /// Attach learned linear codec artifacts for `learned_linear` schema codecs.
+    pub fn with_codec_registry(mut self, registry: CodecRegistry) -> Self {
+        self.codec_registry = Some(registry);
+        self
+    }
+
+    pub fn codec_registry(&self) -> Option<&CodecRegistry> {
+        self.codec_registry.as_ref()
     }
 
     /// Drain and return accumulated trace events. Returns empty when tracing is
@@ -393,7 +414,19 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
             return Ok(None);
         }
 
-        let input = encode_input(call, ctx);
+        let input = match encode_input(call, ctx, self.codec_registry.as_ref()) {
+            Ok(input) => input,
+            Err(err) => {
+                self.metrics.failed += 1;
+                self.emit_trace(
+                    call.layer,
+                    call.feature,
+                    ctx.position,
+                    CallOutcome::Failed(err.to_string()),
+                );
+                return handle_failure(call, hidden_size, err);
+            }
+        };
         let t0 = std::time::Instant::now();
         let raw = match self.runner.run(call, input) {
             Ok(raw) => raw,
@@ -422,7 +455,8 @@ impl<R: CallProgramRunner> MontyCallRuntime<R> {
             return Ok(None);
         }
 
-        let mut output = match decode_output(call, &raw, hidden_size) {
+        let mut output = match decode_output(call, &raw, hidden_size, self.codec_registry.as_ref())
+        {
             Ok(output) => output,
             Err(err) => {
                 self.metrics.failed += 1;
@@ -508,7 +542,11 @@ pub fn should_fire(trigger: &CallTrigger, candidate: CallCandidate) -> bool {
     true
 }
 
-pub fn encode_input(call: &CallPatchOp, ctx: &CallContext<'_>) -> Value {
+pub fn encode_input(
+    call: &CallPatchOp,
+    ctx: &CallContext<'_>,
+    codecs: Option<&CodecRegistry>,
+) -> Result<Value, CallError> {
     let include_tokens = call
         .input_schema
         .get("include_token_ids")
@@ -527,7 +565,7 @@ pub fn encode_input(call: &CallPatchOp, ctx: &CallContext<'_>) -> Value {
     // Encode the residual according to the source codec specified in input_schema.
     // The structured schema form is: {"sources": [{"kind": "current_residual", "key": "K", "codec": {...}}]}
     // Legacy flat form omits sources and defaults to raw_f32 under key "residual".
-    let residual_encoded = encode_residual_source(call, ctx.residual);
+    let residual_encoded = encode_residual_source(call, ctx.residual, codecs)?;
     for (k, v) in residual_encoded {
         obj.insert(k, v);
     }
@@ -540,12 +578,16 @@ pub fn encode_input(call: &CallPatchOp, ctx: &CallContext<'_>) -> Value {
             obj.insert("text".into(), json!(text));
         }
     }
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// Encode the residual source(s) from a call's input_schema.
 /// Returns a vec of (key, encoded_value) pairs to insert into the input dict.
-fn encode_residual_source(call: &CallPatchOp, residual: &[f32]) -> Vec<(String, Value)> {
+fn encode_residual_source(
+    call: &CallPatchOp,
+    residual: &[f32],
+    codecs: Option<&CodecRegistry>,
+) -> Result<Vec<(String, Value)>, CallError> {
     if let Some(sources) = call.input_schema.get("sources").and_then(|s| s.as_array()) {
         let mut out = Vec::new();
         for src in sources {
@@ -560,44 +602,50 @@ fn encode_residual_source(call: &CallPatchOp, residual: &[f32]) -> Vec<(String, 
                 .get("key")
                 .and_then(|k| k.as_str())
                 .unwrap_or("residual");
-            let codec_kind = src
-                .get("codec")
-                .and_then(|c| c.get("kind"))
+            let codec_value = src.get("codec").unwrap_or(&Value::Null);
+            let codec_kind = codec_value
+                .get("kind")
                 .and_then(|k| k.as_str())
                 .unwrap_or("raw_f32");
             let encoded = match codec_kind {
                 "top_k_basis" => {
-                    let k = src
-                        .get("codec")
-                        .and_then(|c| c.get("k"))
+                    let k = codec_value
+                        .get("k")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(8) as usize;
-                    if let Some(basis) =
-                        extract_basis_from_schema(src.get("codec").unwrap_or(&Value::Null))
-                    {
+                    if let Some(basis) = extract_basis_from_schema(codec_value) {
                         encode_topk_basis(residual, &basis, k)
                     } else {
                         json!(residual) // fallback to raw if basis missing
                     }
+                }
+                "learned_linear" => {
+                    let registry = codecs.ok_or_else(|| {
+                        CallError::ProgramRun(format!(
+                            "learned_linear codec `{key}` requires a codec registry"
+                        ))
+                    })?;
+                    encode_learned_linear(residual, codec_value, registry)?
                 }
                 _ => json!(residual), // raw_f32 default
             };
             out.push((key.to_string(), encoded));
         }
         if !out.is_empty() {
-            return out;
+            return Ok(out);
         }
     }
     // Legacy flat schema: always raw residual under "residual"
-    vec![("residual".to_string(), json!(residual))]
+    Ok(vec![("residual".to_string(), json!(residual))])
 }
 
 pub fn decode_output(
     call: &CallPatchOp,
     obj: &Value,
     hidden_size: usize,
+    codecs: Option<&CodecRegistry>,
 ) -> Result<CallOutput, CallError> {
-    let residual_delta = decode_residual_delta_sink(call, obj, hidden_size)?;
+    let residual_delta = decode_residual_delta_sink(call, obj, hidden_size, codecs)?;
 
     let logit_key = output_key(call, "logit_bias", "logit_bias");
     let logit_bias = match obj.get(&logit_key) {
@@ -617,6 +665,7 @@ fn decode_residual_delta_sink(
     call: &CallPatchOp,
     obj: &Value,
     hidden_size: usize,
+    codecs: Option<&CodecRegistry>,
 ) -> Result<Option<Vec<f32>>, CallError> {
     if let Some(sinks) = call.output_schema.get("sinks").and_then(|s| s.as_array()) {
         for sink in sinks {
@@ -631,9 +680,9 @@ fn decode_residual_delta_sink(
                 .get("key")
                 .and_then(|k| k.as_str())
                 .unwrap_or("residual_delta");
-            let codec_kind = sink
-                .get("codec")
-                .and_then(|c| c.get("kind"))
+            let codec_value = sink.get("codec").unwrap_or(&Value::Null);
+            let codec_kind = codec_value
+                .get("kind")
                 .and_then(|k| k.as_str())
                 .unwrap_or("raw_f32");
 
@@ -641,13 +690,21 @@ fn decode_residual_delta_sink(
                 None => Ok(None),
                 Some(value) => match codec_kind {
                     "sparse_basis_delta" => {
-                        if let Some(basis) =
-                            extract_basis_from_schema(sink.get("codec").unwrap_or(&Value::Null))
-                        {
+                        if let Some(basis) = extract_basis_from_schema(codec_value) {
                             decode_sparse_basis_delta(key, value, &basis, hidden_size).map(Some)
                         } else {
                             decode_f32_array(key, value, Some(hidden_size)).map(Some)
                         }
+                    }
+                    "learned_linear" => {
+                        let registry = codecs.ok_or_else(|| {
+                            CallError::ProgramRun(format!(
+                                "learned_linear decode for `{key}` requires a codec registry"
+                            ))
+                        })?;
+                        decode_learned_linear(key, value, codec_value, registry, hidden_size)
+                            .map(Some)
+                            .map_err(Into::into)
                     }
                     _ => decode_f32_array(key, value, Some(hidden_size)).map(Some),
                 },
@@ -853,8 +910,7 @@ fn decode_sparse_logit_bias(value: &Value) -> Result<SparseLogitBias, CallError>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use larql_vindex::{CallResourceLimits, CallSafetyPolicy};
+    use super::*;use larql_vindex::{CallResourceLimits, CallSafetyPolicy};
 
     struct StaticRunner {
         output: Value,
@@ -959,7 +1015,7 @@ mod tests {
             token_ids: &[10, 11],
             token_text: Some("hi"),
         };
-        let encoded = encode_input(&call, &ctx);
+        let encoded = encode_input(&call, &ctx, None).unwrap();
         assert_eq!(encoded["layer"], 2);
         assert_eq!(encoded["position"], 4);
         assert_eq!(encoded["residual"], json!([1.0, -2.0]));
@@ -977,6 +1033,7 @@ mod tests {
                 "bias": {"token_ids": [42, 43], "biases": [1.5, -0.5]}
             }),
             3,
+            None,
         )
         .unwrap();
         assert_eq!(output.residual_delta.unwrap(), vec![0.1, 0.2, 0.3]);
@@ -987,7 +1044,7 @@ mod tests {
 
     #[test]
     fn decode_output_rejects_wrong_residual_width() {
-        let err = decode_output(&call(), &json!({"delta": [1.0, 2.0]}), 3).unwrap_err();
+        let err = decode_output(&call(), &json!({"delta": [1.0, 2.0]}), 3, None).unwrap_err();
         assert!(matches!(
             err,
             CallError::WrongLength {
@@ -1439,7 +1496,7 @@ mod tests {
             token_ids: &[],
             token_text: None,
         };
-        let encoded = encode_input(&call_op, &ctx);
+        let encoded = encode_input(&call_op, &ctx, None).unwrap();
         let compressed = &encoded["compressed"];
         assert!(compressed.get("indices").is_some(), "should have indices");
         assert!(compressed.get("values").is_some(), "should have values");
@@ -1456,6 +1513,53 @@ mod tests {
             !indices.contains(&2),
             "idx 2 (score 1) should not be in top-2"
         );
+    }
+
+    #[test]
+    fn encode_input_uses_learned_linear_codec_when_registry_present() {
+        use crate::monty_call::codec::LearnedLinearCodec;
+
+        let mut registry = CodecRegistry::new();
+        let mut weights = vec![0.0f32; 6];
+        weights[0] = 1.0; // row 0, col 0
+        weights[4] = 1.0; // row 1, col 1
+        let codec = LearnedLinearCodec::new("enc_v1", 3, 2, weights, vec![0.0, 0.0]).unwrap();
+        registry.insert(codec);
+
+        let call_op = CallPatchOp {
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            monty_code: "".into(),
+            code_hash: None,
+            input_schema: json!({
+                "sources": [{
+                    "kind": "current_residual",
+                    "key": "compressed",
+                    "codec": {
+                        "kind": "learned_linear",
+                        "artifact_id": "enc_v1",
+                        "input_dim": 3,
+                        "output_dim": 2
+                    }
+                }]
+            }),
+            output_schema: Value::Null,
+            trigger: CallTrigger::default(),
+            limits: larql_vindex::CallResourceLimits::default(),
+            safety: larql_vindex::CallSafetyPolicy::default(),
+            metadata: Value::Null,
+        };
+        let residual = vec![5.0f32, -3.0, 1.0];
+        let ctx = CallContext {
+            layer: 0,
+            position: 0,
+            residual: &residual,
+            token_ids: &[],
+            token_text: None,
+        };
+        let encoded = encode_input(&call_op, &ctx, Some(&registry)).unwrap();
+        assert_eq!(encoded["compressed"], json!([5.0, -3.0]));
     }
 
     #[test]

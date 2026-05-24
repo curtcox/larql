@@ -5401,3 +5401,41 @@ fn compile_into_vindex_static_only_with_call_patch_returns_error() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn use_vindex_auto_applies_runtime_patches_sidecar() {
+    let (mut session, dir) = vindex_session("use_runtime_sidecar");
+    let gate = vec![1.0f32, 0.0, 0.0, 0.0];
+    let patch_path = write_call_patch_json(&dir, &gate);
+
+    let attach = parser::parse(&format!(
+        r#"ATTACH CALL FROM FILE "{}";"#,
+        lql_path(&patch_path)
+    ))
+    .unwrap();
+    session.execute(&attach).expect("ATTACH CALL");
+
+    let out_dir = dir.join("compiled.vindex");
+    let compile = parser::parse(&format!(
+        r#"COMPILE CURRENT INTO VINDEX "{}";"#,
+        lql_path(&out_dir)
+    ))
+    .unwrap();
+    session.execute(&compile).expect("COMPILE INTO VINDEX");
+
+    // Fresh session: USE compiled vindex without manually applying patch.
+    let mut fresh = Session::new();
+    let use_stmt = parser::parse(&format!(r#"USE "{}";"#, lql_path(&out_dir))).unwrap();
+    let lines = fresh.execute(&use_stmt).expect("USE compiled vindex");
+    assert!(
+        lines.iter().any(|l| l.contains("Runtime call patches: 1")),
+        "USE should report runtime sidecar: {lines:?}"
+    );
+    let overlay = fresh.patched_overlay_mut().expect("patched overlay");
+    assert!(
+        overlay.call_patch(0, 1).is_some(),
+        "runtime sidecar should be auto-applied on USE"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -106,6 +106,7 @@ impl Session {
             relation_classifier,
             router,
             memit_store,
+            call_codec_registry: larql_inference::monty_call::CodecRegistry::new(),
         };
 
         Ok(out)

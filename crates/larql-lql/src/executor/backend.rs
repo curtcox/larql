@@ -37,6 +37,8 @@ pub(crate) enum Backend {
         /// `patched` + `memit_store` + the epoch / mutation counters
         /// currently duplicated on `Session`.)
         memit_store: larql_vindex::MemitStore,
+        /// Learned linear codec artifacts from `<vindex>/call_codecs/`.
+        call_codec_registry: larql_inference::monty_call::CodecRegistry,
     },
     /// Direct model weight access — no vindex extraction needed.
     /// Supports INFER, EXPLAIN INFER, and STATS. Browse/mutation ops
@@ -174,6 +176,18 @@ impl Session {
     pub(crate) fn memit_store(&self) -> Option<&larql_vindex::MemitStore> {
         match &self.backend {
             Backend::Vindex { memit_store, .. } => Some(memit_store),
+            _ => None,
+        }
+    }
+
+    /// Readonly access to learned linear codec artifacts loaded from
+    /// `<vindex>/call_codecs/` at `USE` time.
+    pub(crate) fn call_codec_registry(&self) -> Option<&larql_inference::monty_call::CodecRegistry> {
+        match &self.backend {
+            Backend::Vindex {
+                call_codec_registry,
+                ..
+            } if !call_codec_registry.is_empty() => Some(call_codec_registry),
             _ => None,
         }
     }

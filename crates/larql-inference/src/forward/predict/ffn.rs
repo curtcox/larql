@@ -12,7 +12,8 @@ use crate::ffn::{FfnBackend, LayerFfnRouter};
 use crate::layer_graph::generate::{EosConfig, GenerateError};
 use crate::model::ModelWeights;
 use crate::monty_call::{
-    CallProgramRunner, CallTraceEvent, MontyCallMetrics, MontyCallRuntime, MontyVmRunner,
+    load_codec_registry_from_dir, CallProgramRunner, CallTraceEvent, CodecRegistry,
+    MontyCallMetrics, MontyCallRuntime, MontyVmRunner,
 };
 use crate::vindex::{WalkFfn, WalkFfnConfig};
 use ndarray::Array2;
@@ -77,12 +78,45 @@ pub fn predict_with_ffn(
 pub struct PredictCallPatchesOptions {
     /// Collect per-event trace. Populated in [`PredictResultWithCallMetrics::trace_events`].
     pub trace: bool,
+    /// Learned linear codec artifacts for `learned_linear` input/output schemas.
+    pub codec_registry: Option<CodecRegistry>,
 }
 
 impl PredictCallPatchesOptions {
     pub fn with_trace(mut self) -> Self {
         self.trace = true;
         self
+    }
+
+    pub fn with_codec_registry(mut self, registry: CodecRegistry) -> Self {
+        self.codec_registry = Some(registry);
+        self
+    }
+
+    /// Load `call_codecs/*.json` from a vindex directory when present.
+    pub fn with_codec_registry_from_dir(mut self, vindex_dir: &std::path::Path) -> Self {
+        let registry = load_codec_registry_from_dir(vindex_dir);
+        if !registry.is_empty() {
+            self.codec_registry = Some(registry);
+        }
+        self
+    }
+}
+
+fn build_call_patch_runtime<R: CallProgramRunner>(
+    runner: R,
+    opts: &PredictCallPatchesOptions,
+) -> MontyCallRuntime<R> {
+    let runtime = MontyCallRuntime::new(runner);
+    let runtime = if opts.trace {
+        runtime.with_trace_events()
+    } else {
+        runtime
+    };
+    if let Some(registry) = opts.codec_registry.clone() {
+        runtime.with_codec_registry(registry)
+    } else {
+        runtime
     }
 }
 
@@ -129,12 +163,7 @@ pub fn predict_with_call_patches_runner<R: CallProgramRunner>(
     opts: PredictCallPatchesOptions,
     backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> PredictResultWithCallMetrics {
-    let base_runtime = MontyCallRuntime::new(runner);
-    let base_runtime = if opts.trace {
-        base_runtime.with_trace_events()
-    } else {
-        base_runtime
-    };
+    let base_runtime = build_call_patch_runtime(runner, &opts);
     let runtime = RefCell::new(base_runtime);
     let mut ffn = WalkFfn::from_config(weights, patched, config)
         .with_call_patches(patched)
@@ -259,12 +288,7 @@ pub fn generate_with_call_patches_runner<R: CallProgramRunner>(
         };
     }
 
-    let base_runtime = MontyCallRuntime::new(runner);
-    let base_runtime = if opts.trace {
-        base_runtime.with_trace_events()
-    } else {
-        base_runtime
-    };
+    let base_runtime = build_call_patch_runtime(runner, &opts);
     let runtime = RefCell::new(base_runtime);
     runtime.borrow_mut().reset_sequence_state();
 

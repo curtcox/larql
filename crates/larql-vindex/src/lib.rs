@@ -103,8 +103,8 @@ pub use format::weights::{
 
 // Patch
 pub use patch::core::{
-    CallPatchOp, CallResourceLimits, CallSafetyPolicy, CallTrigger, PatchCounts, PatchOp,
-    PatchedVindex, VindexPatch,
+    load_runtime_patches_sidecar, CallPatchOp, CallResourceLimits, CallSafetyPolicy,
+    CallTrigger, PatchCounts, PatchOp, PatchedVindex, VindexPatch,
 };
 pub use patch::knn_store::{KnnEntry, KnnStore};
 pub use patch::refine::{refine_gates, RefineInput, RefineResult, RefinedGate};

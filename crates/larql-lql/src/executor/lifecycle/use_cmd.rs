@@ -52,15 +52,6 @@ impl Session {
                     _ => String::new(),
                 };
 
-                let out = vec![format!(
-                    "Using: {} ({} layers, {} features, model: {}{})",
-                    path.display(),
-                    config.num_layers,
-                    format_number(total_features),
-                    config.model,
-                    rc_status,
-                )];
-
                 let router = larql_vindex::RouterIndex::load(&path, &config);
                 let mut patched = larql_vindex::PatchedVindex::new(index);
 
@@ -75,6 +66,42 @@ impl Session {
                             eprintln!("warning: failed to load knn_store.bin: {e}");
                         }
                     }
+                }
+
+                // Auto-apply runtime call-patch sidecar from COMPILE INTO VINDEX.
+                let mut runtime_call_count = 0usize;
+                match larql_vindex::load_runtime_patches_sidecar(&path) {
+                    Ok(Some(sidecar)) => {
+                        runtime_call_count = sidecar.counts_detailed().calls;
+                        patched.apply_patch(sidecar);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("warning: failed to load runtime_patches.vlp: {e}");
+                    }
+                }
+
+                let call_codec_registry =
+                    larql_inference::monty_call::load_codec_registry_from_dir(&path);
+
+                let mut out = vec![format!(
+                    "Using: {} ({} layers, {} features, model: {}{})",
+                    path.display(),
+                    config.num_layers,
+                    format_number(total_features),
+                    config.model,
+                    rc_status,
+                )];
+                if runtime_call_count > 0 {
+                    out.push(format!(
+                        "Runtime call patches: {runtime_call_count} (from runtime_patches.vlp sidecar)"
+                    ));
+                }
+                if !call_codec_registry.is_empty() {
+                    out.push(format!(
+                        "Call codecs: {} artifact(s) from call_codecs/",
+                        call_codec_registry.len()
+                    ));
                 }
 
                 // Rehydrate the L2 MEMIT store from disk if a previous
@@ -97,6 +124,7 @@ impl Session {
                     relation_classifier,
                     router,
                     memit_store,
+                    call_codec_registry,
                 };
                 // Reset any previous patch session
                 self.patch_recording = None;

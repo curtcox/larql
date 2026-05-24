@@ -193,7 +193,7 @@ fn bench_encoder_raw_vs_topk(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new("raw_f32", hlabel),
                 &hidden,
-                |b, _| b.iter(|| encode_input(&patch, &ctx)),
+                |b, _| b.iter(|| encode_input(&patch, &ctx, None).unwrap()),
             );
         }
 

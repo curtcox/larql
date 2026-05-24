@@ -337,6 +337,20 @@ impl VindexPatch {
     }
 }
 
+/// Load the runtime call-patch sidecar emitted by `COMPILE INTO VINDEX`.
+///
+/// Returns `Ok(None)` when the sidecar file is absent — compiled vindexes
+/// without call patches do not carry one.
+pub fn load_runtime_patches_sidecar(vindex_dir: &Path) -> Result<Option<VindexPatch>, VindexError> {
+    use crate::format::filenames::RUNTIME_PATCHES_VLP;
+
+    let path = vindex_dir.join(RUNTIME_PATCHES_VLP);
+    if !path.exists() {
+        return Ok(None);
+    }
+    VindexPatch::load(&path).map(Some)
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Base64 gate vector encoding
 // ═══════════════════════════════════════════════════════════════
@@ -861,5 +875,45 @@ mod tests {
         assert_eq!(call.code_hash.as_deref(), Some(first.as_str()));
         assert!(first.starts_with("sha256:"));
         assert_eq!(first.len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn load_runtime_patches_sidecar_missing_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let loaded = load_runtime_patches_sidecar(dir.path()).unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn load_runtime_patches_sidecar_loads_present_file() {
+        let dir = TempDir::new().unwrap();
+        let sidecar_path = dir.path().join(crate::format::filenames::RUNTIME_PATCHES_VLP);
+        let patch = VindexPatch {
+            version: 1,
+            base_model: String::new(),
+            base_checksum: None,
+            created_at: "compiled".into(),
+            description: None,
+            author: None,
+            tags: vec![],
+            operations: vec![PatchOp::Call(CallPatchOp {
+                layer: 1,
+                feature: 2,
+                gate_vector_b64: None,
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: None,
+                input_schema: serde_json::Value::Null,
+                output_schema: serde_json::Value::Null,
+                trigger: CallTrigger::default(),
+                limits: CallResourceLimits::default(),
+                safety: CallSafetyPolicy::default(),
+                metadata: serde_json::Value::Null,
+            })],
+        };
+        patch.save(&sidecar_path).unwrap();
+        let loaded = load_runtime_patches_sidecar(dir.path())
+            .unwrap()
+            .expect("sidecar should load");
+        assert_eq!(loaded.counts_detailed().calls, 1);
     }
 }

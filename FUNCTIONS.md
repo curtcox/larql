@@ -81,10 +81,10 @@ Still remaining
 * Expand inline LQL beyond the current file-backed/gate-code vertical slice if
   richer `INPUT (...)`, `OUTPUT (...)`, and policy grammar proves necessary.
 * Build the codec roadmap beyond the current raw residual / top-k basis /
-  sparse basis delta / sparse logit-bias support (M6: learned linear codec
-  artifact format).
-* M7: `COMPILE INTO MODEL` hard rejection; `COMPILE INTO VINDEX` strict /
-  runtime-sidecar modes; docs and examples.
+  sparse basis delta / sparse logit-bias / learned linear support (M6 done for
+  learned linear artifact format; training-time codec learning remains M8+).
+* ~~M7: `COMPILE INTO MODEL` hard rejection; `COMPILE INTO VINDEX` strict /
+  runtime-sidecar modes; docs and examples.~~ (done)
 * Implement the training prototype and later research-grade training loop.
 
 Recommended next milestone
@@ -102,8 +102,7 @@ state once at the start, and return `GenerateResultWithCallMetrics` with
 aggregate `call_metrics` and optional per-event `trace_events`.
 
 The next highest-leverage steps are production safety hardening, benchmarks,
-and the training pipeline (M6 codecs beyond the current vertical slice, M7
-compile/artifact modes).
+and the training pipeline (M8+).
 
 Reading note
 
@@ -277,9 +276,30 @@ Fused GPU prefill + decode with call patches — complete:
 
 Still incomplete:
 
-* M6 learned linear codec artifact format.
-* M7 compile/artifact strict modes (partially done).
 * Training prototype (M8+).
+
+M6 learned linear codec artifact format — complete:
+
+* `call_codecs/<artifact_id>.json` stores versioned row-major `W[output_dim × input_dim]`
+  plus optional bias (base64 f32).
+* `LearnedLinearCodec`, `LearnedLinearCodecArtifact`, `CodecRegistry`, and
+  `load_codec_registry_from_dir` live in `larql-inference/src/monty_call/codec.rs`.
+* Input/output schemas support `"kind": "learned_linear"` with `artifact_id`,
+  `input_dim`, and `output_dim`.
+* `MontyCallRuntime::with_codec_registry` and
+  `PredictCallPatchesOptions::with_codec_registry` /
+  `with_codec_registry_from_dir` thread artifacts into encode/decode.
+* `USE` loads `call_codecs/` and reports artifact count; `COMPILE INTO VINDEX`
+  copies the directory alongside `runtime_patches.vlp`.
+
+M7 compile/artifact strict modes — complete:
+
+* `COMPILE INTO MODEL` hard-rejects call patches (existing).
+* `COMPILE INTO VINDEX` writes `runtime_patches.vlp` sidecar; `STATIC_ONLY` rejects.
+* `load_runtime_patches_sidecar` + fresh `USE` auto-applies the sidecar and reports
+  call count (no silent drop).
+* `RUNTIME_PATCHES_VLP` and `CALL_CODECS_DIR` filename constants in
+  `larql-vindex/src/format/filenames.rs`.
 
 ⸻
 
