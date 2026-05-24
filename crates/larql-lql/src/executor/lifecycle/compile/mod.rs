@@ -153,3 +153,22 @@ fn collect_memit_facts_with_recording(
 
     Ok(CollectedMemitFacts { facts, warnings })
 }
+
+pub(super) fn reject_runtime_call_patches(
+    patched: &larql_vindex::PatchedVindex,
+    recording_ops: &[larql_vindex::PatchOp],
+    target: &str,
+) -> Result<(), LqlError> {
+    let has_call = patched
+        .patches
+        .iter()
+        .flat_map(|p| p.operations.iter())
+        .chain(recording_ops.iter())
+        .any(|op| matches!(op, larql_vindex::PatchOp::Call(_)));
+    if has_call {
+        return Err(LqlError::Execution(format!(
+            "COMPILE INTO {target} does not support runtime call patches yet"
+        )));
+    }
+    Ok(())
+}

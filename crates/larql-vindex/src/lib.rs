@@ -102,7 +102,7 @@ pub use format::weights::{
 };
 
 // Patch
-pub use patch::core::{PatchOp, PatchedVindex, VindexPatch};
+pub use patch::core::{CallPatchOp, PatchOp, PatchedVindex, VindexPatch};
 pub use patch::knn_store::{KnnEntry, KnnStore};
 pub use patch::refine::{refine_gates, RefineInput, RefineResult, RefinedGate};
 

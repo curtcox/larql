@@ -17,7 +17,7 @@ use ndarray::Array1;
 use crate::index::storage::vindex_storage::VindexStorage;
 use crate::index::{FeatureMeta, VectorIndex, WalkHit, WalkTrace};
 
-use super::format::VindexPatch;
+use super::format::{CallPatchOp, VindexPatch};
 
 /// Per-layer contiguous gate-override snapshot built lazily by
 /// `gate_knn`. Keeps the override matvec cache-friendly — same memory
@@ -102,6 +102,9 @@ pub struct PatchedVindex {
     pub(crate) overrides_gate: HashMap<(usize, usize), Vec<f32>>,
     /// Tombstones for deleted features.
     pub(crate) deleted: std::collections::HashSet<(usize, usize)>,
+    /// Runtime call-patch metadata keyed by the same gate slot used for
+    /// candidate selection.
+    pub(crate) call_patches: HashMap<(usize, usize), CallPatchOp>,
     /// Architecture B: per-layer retrieval-override KNN store.
     pub knn_store: super::knn_store::KnnStore,
     /// Lazy per-layer cache of `overrides_gate` flattened into a
@@ -122,6 +125,7 @@ impl PatchedVindex {
             overrides_meta: HashMap::new(),
             overrides_gate: HashMap::new(),
             deleted: std::collections::HashSet::new(),
+            call_patches: HashMap::new(),
             knn_store: super::knn_store::KnnStore::default(),
             gate_cache: RwLock::new(HashMap::new()),
         }
@@ -225,7 +229,20 @@ impl PatchedVindex {
         self.overrides_meta.insert(key, Some(meta));
         self.overrides_gate.insert(key, gate_vec);
         self.deleted.remove(&key);
+        self.call_patches.remove(&key);
         self.invalidate_gate_cache_layer(layer);
+    }
+
+    /// Insert a runtime call patch into the overlay. Gate selection stays
+    /// identical to a regular inserted feature; consumers that know about
+    /// call patches can retrieve the metadata after `gate_knn`.
+    pub fn insert_call_patch(&mut self, call: CallPatchOp, gate_vec: Vec<f32>) {
+        let key = (call.layer, call.feature);
+        self.overrides_meta.insert(key, None);
+        self.overrides_gate.insert(key, gate_vec);
+        self.deleted.remove(&key);
+        self.call_patches.insert(key, call);
+        self.invalidate_gate_cache_layer(key.0);
     }
 
     /// Delete a feature via the overlay.
@@ -234,6 +251,7 @@ impl PatchedVindex {
         self.overrides_meta.insert(key, None);
         self.deleted.insert(key);
         self.overrides_gate.remove(&key);
+        self.call_patches.remove(&key);
         self.invalidate_gate_cache_layer(layer);
     }
 
@@ -317,6 +335,20 @@ impl PatchedVindex {
         self.overrides_gate
             .iter()
             .map(|(&(l, f), v)| (l, f, v.as_slice()))
+    }
+
+    /// Runtime call patch for a selected gate slot, if one exists.
+    pub fn call_patch(&self, layer: usize, feature: usize) -> Option<&CallPatchOp> {
+        self.call_patches.get(&(layer, feature))
+    }
+
+    /// Runtime call patches installed on a layer. This allocates a small
+    /// vector by design so the overlay keeps its canonical key map.
+    pub fn call_patches_for_layer(&self, layer: usize) -> Vec<&CallPatchOp> {
+        self.call_patches
+            .iter()
+            .filter_map(|(&(l, _), call)| (l == layer).then_some(call))
+            .collect()
     }
 
     /// Replace the gate override for `(layer, feature)` with a new

@@ -20,7 +20,7 @@ use super::atomic::run_atomic_compile;
 use super::bake::{
     apply_memit_deltas_to_down_weights, patch_down_weights, patch_gate_vectors, patch_up_weights,
 };
-use super::collect_memit_facts_with_recording;
+use super::{collect_memit_facts_with_recording, reject_runtime_call_patches};
 
 /// Walk the ordered patch history and return the (layer, feature) slots
 /// touched by more than one patch, along with the write count. Used by
@@ -129,6 +129,7 @@ impl Session {
             .as_ref()
             .map(|r| r.operations.clone())
             .unwrap_or_default();
+        reject_runtime_call_patches(patched, &recording_ops, "VINDEX")?;
         let collected = collect_memit_facts_with_recording(patched, path, &recording_ops)?;
         let memit_facts = collected.facts;
         let memit_warnings = collected.warnings;

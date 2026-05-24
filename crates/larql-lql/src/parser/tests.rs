@@ -1895,6 +1895,15 @@ fn parse_trace_full() {
     }
 }
 
+#[test]
+fn parse_attach_call_from_file() {
+    let stmt = parse(r#"ATTACH CALL FROM FILE "call_patch.json";"#).unwrap();
+    match stmt {
+        Statement::AttachCall { path } => assert_eq!(path, "call_patch.json"),
+        _ => panic!("expected AttachCall"),
+    }
+}
+
 // ══════════════════════════════════════════════════════════════
 // Range validation
 // ══════════════════════════════════════════════════════════════

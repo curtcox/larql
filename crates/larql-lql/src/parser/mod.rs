@@ -80,6 +80,7 @@ impl Parser {
             Token::Keyword(Keyword::Save) => self.parse_save(),
             Token::Keyword(Keyword::Apply) => self.parse_apply(),
             Token::Keyword(Keyword::Remove) => self.parse_remove(),
+            Token::Keyword(Keyword::Attach) => self.parse_attach(),
             Token::Keyword(Keyword::Trace) => self.parse_trace(),
             Token::Keyword(Keyword::Compact) => self.parse_compact(),
             _ => Err(ParseError(format!(

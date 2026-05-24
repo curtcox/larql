@@ -82,6 +82,7 @@ impl PatchedVindex {
                     };
                     self.overrides_meta.insert(key, Some(meta));
                     self.deleted.remove(&key);
+                    self.call_patches.remove(&key);
                     if let Some(b64) = gate_vector_b64 {
                         if let Ok(vec) = decode_gate_vector(b64) {
                             self.overrides_gate.insert(key, vec);
@@ -118,6 +119,7 @@ impl PatchedVindex {
                             }],
                         };
                         self.overrides_meta.insert(key, Some(meta));
+                        self.call_patches.remove(&key);
                     }
                     if let Some(b64) = gate_vector_b64 {
                         if let Ok(vec) = decode_gate_vector(b64) {
@@ -139,12 +141,24 @@ impl PatchedVindex {
                 PatchOp::Delete { .. } => {
                     self.overrides_meta.insert(key, None);
                     self.deleted.insert(key);
+                    self.call_patches.remove(&key);
                     // Always invalidate on Delete — even if the gate
                     // entry was absent, the per-layer feature set
                     // shrunk and any cached matrix is stale.
                     let was_present = self.overrides_gate.remove(&key).is_some();
                     if was_present {
                         touched_layers.insert(key.0);
+                    }
+                }
+                PatchOp::Call(call) => {
+                    self.overrides_meta.insert(key, None);
+                    self.deleted.remove(&key);
+                    self.call_patches.insert(key, call.clone());
+                    if let Some(b64) = &call.gate_vector_b64 {
+                        if let Ok(vec) = decode_gate_vector(b64) {
+                            self.overrides_gate.insert(key, vec);
+                            touched_layers.insert(key.0);
+                        }
                     }
                 }
                 PatchOp::InsertKnn { .. } | PatchOp::DeleteKnn { .. } => {
@@ -176,6 +190,7 @@ impl PatchedVindex {
         self.overrides_meta.clear();
         self.overrides_gate.clear();
         self.deleted.clear();
+        self.call_patches.clear();
         self.knn_store = super::knn_store::KnnStore::default();
         self.invalidate_gate_cache();
         let patches: Vec<VindexPatch> = self.patches.drain(..).collect();

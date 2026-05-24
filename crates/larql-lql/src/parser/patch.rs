@@ -39,4 +39,15 @@ impl Parser {
         self.eat_semicolon();
         Ok(Statement::RemovePatch { path })
     }
+
+    /// Parse ATTACH CALL FROM FILE "call_patch.json".
+    pub(crate) fn parse_attach(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword(Keyword::Attach)?;
+        self.expect_keyword(Keyword::Call)?;
+        self.expect_keyword(Keyword::From)?;
+        self.expect_ident_eq("file")?;
+        let path = self.expect_string()?;
+        self.eat_semicolon();
+        Ok(Statement::AttachCall { path })
+    }
 }

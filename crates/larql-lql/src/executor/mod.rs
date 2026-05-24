@@ -268,6 +268,12 @@ impl Session {
             Statement::ApplyPatch { path } => self.exec_apply_patch(path),
             Statement::ShowPatches => self.exec_show_patches(),
             Statement::RemovePatch { path } => self.exec_remove_patch(path),
+            Statement::AttachCall { path } => {
+                let mut out = self.ensure_patch_session();
+                out.extend(self.exec_attach_call(path)?);
+                self.advance_epoch();
+                Ok(out)
+            }
             // ── Trace commands ──
             Statement::Trace {
                 prompt,
@@ -322,6 +328,9 @@ impl Session {
             Statement::ApplyPatch { path } => self.remote_apply_local_patch(path),
             Statement::ShowPatches => self.remote_show_patches(),
             Statement::RemovePatch { path } => self.remote_remove_local_patch(path),
+            Statement::AttachCall { .. } => Err(LqlError::Execution(
+                "ATTACH CALL requires a local vindex backend".into(),
+            )),
             Statement::Pipe { left, right } => {
                 let mut out = self.execute(left)?;
                 out.extend(self.execute(right)?);
@@ -503,6 +512,42 @@ impl Session {
         }
     }
 
+    fn exec_attach_call(&mut self, path: &str) -> Result<Vec<String>, LqlError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| LqlError::Execution(format!("failed to read call patch {path}: {e}")))?;
+        let op = parse_call_patch_op(&text)?;
+        let call = match &op {
+            larql_vindex::PatchOp::Call(call) => call.clone(),
+            _ => {
+                return Err(LqlError::Execution(
+                    "ATTACH CALL FROM FILE expects a JSON PatchOp with op=\"call\"".into(),
+                ))
+            }
+        };
+        let gate_vec = call
+            .gate_vector_b64
+            .as_deref()
+            .ok_or_else(|| LqlError::Execution("call patch missing gate_vector_b64".into()))
+            .and_then(|b64| {
+                larql_vindex::patch::format::decode_gate_vector(b64)
+                    .map_err(|e| LqlError::exec("failed to decode call gate_vector_b64", e))
+            })?;
+
+        match &mut self.backend {
+            Backend::Vindex { patched, .. } => patched.insert_call_patch(call.clone(), gate_vec),
+            _ => return Err(LqlError::NoBackend),
+        }
+
+        if let Some(recording) = &mut self.patch_recording {
+            recording.operations.push(op);
+        }
+
+        Ok(vec![format!(
+            "Attached call patch: L{} F{} from {path}",
+            call.layer, call.feature
+        )])
+    }
+
     /// Bump the LSM epoch + minor/major mutation counters. Called after
     /// every INSERT/DELETE/UPDATE.
     pub(crate) fn advance_epoch(&mut self) {
@@ -510,4 +555,30 @@ impl Session {
         self.mutations_since_minor += 1;
         self.mutations_since_major += 1;
     }
+}
+
+fn parse_call_patch_op(text: &str) -> Result<larql_vindex::PatchOp, LqlError> {
+    if let Ok(op) = serde_json::from_str::<larql_vindex::PatchOp>(text) {
+        return Ok(op);
+    }
+    let patch: larql_vindex::VindexPatch = serde_json::from_str(text).map_err(|e| {
+        LqlError::Execution(format!(
+            "failed to parse call patch JSON as PatchOp or VindexPatch: {e}"
+        ))
+    })?;
+    let mut calls = patch
+        .operations
+        .into_iter()
+        .filter(|op| matches!(op, larql_vindex::PatchOp::Call(_)));
+    let Some(op) = calls.next() else {
+        return Err(LqlError::Execution(
+            "VindexPatch contains no op=\"call\" operation".into(),
+        ));
+    };
+    if calls.next().is_some() {
+        return Err(LqlError::Execution(
+            "ATTACH CALL FROM FILE accepts exactly one call operation".into(),
+        ));
+    }
+    Ok(op)
 }

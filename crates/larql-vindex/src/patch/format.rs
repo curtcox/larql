@@ -91,6 +91,10 @@ pub enum PatchOp {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// Runtime call patch. The gate vector participates in ordinary
+    /// `gate_knn`; the call metadata is retrieved separately by inference
+    /// after candidate selection.
+    Call(CallPatchOp),
     /// Architecture B: residual-key KNN insert.
     #[serde(rename = "insert_knn")]
     InsertKnn {
@@ -127,9 +131,33 @@ impl PatchOp {
             PatchOp::Insert { layer, feature, .. } => Some((*layer, *feature)),
             PatchOp::Update { layer, feature, .. } => Some((*layer, *feature)),
             PatchOp::Delete { layer, feature, .. } => Some((*layer, *feature)),
+            PatchOp::Call(call) => Some((call.layer, call.feature)),
             PatchOp::InsertKnn { .. } | PatchOp::DeleteKnn { .. } => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallPatchOp {
+    pub layer: usize,
+    pub feature: usize,
+    #[serde(default)]
+    pub gate_vector_b64: Option<String>,
+    pub monty_code: String,
+    #[serde(default)]
+    pub code_hash: Option<String>,
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    #[serde(default)]
+    pub output_schema: serde_json::Value,
+    #[serde(default)]
+    pub trigger: serde_json::Value,
+    #[serde(default)]
+    pub limits: serde_json::Value,
+    #[serde(default)]
+    pub safety: serde_json::Value,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -173,6 +201,7 @@ impl VindexPatch {
                 PatchOp::Insert { .. } | PatchOp::InsertKnn { .. } => ins += 1,
                 PatchOp::Update { .. } => upd += 1,
                 PatchOp::Delete { .. } | PatchOp::DeleteKnn { .. } => del += 1,
+                PatchOp::Call(_) => ins += 1,
             }
         }
         (ins, upd, del)
@@ -602,6 +631,48 @@ mod tests {
                 );
             }
             _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn call_patch_json_round_trips() {
+        let gate = vec![1.0f32, -2.0, 3.5];
+        let patch = VindexPatch {
+            version: 1,
+            base_model: "test".into(),
+            base_checksum: None,
+            created_at: "2026-01-01".into(),
+            description: None,
+            author: None,
+            tags: vec![],
+            operations: vec![PatchOp::Call(CallPatchOp {
+                layer: 2,
+                feature: 7,
+                gate_vector_b64: Some(encode_gate_vector(&gate)),
+                monty_code: "def main(input):\n    return input\n".into(),
+                code_hash: Some("sha256:test".into()),
+                input_schema: serde_json::json!({"sources": ["current_residual"]}),
+                output_schema: serde_json::json!({"sinks": ["residual_delta"]}),
+                trigger: serde_json::json!({"score_threshold": 12.0}),
+                limits: serde_json::json!({"time_us": 250}),
+                safety: serde_json::json!({"failure_policy": "ignore"}),
+                metadata: serde_json::json!({"name": "identity"}),
+            })],
+        };
+
+        let json = serde_json::to_string(&patch).unwrap();
+        let loaded: VindexPatch = serde_json::from_str(&json).unwrap();
+        match &loaded.operations[0] {
+            PatchOp::Call(call) => {
+                assert_eq!(call.layer, 2);
+                assert_eq!(call.feature, 7);
+                assert_eq!(
+                    decode_gate_vector(call.gate_vector_b64.as_ref().unwrap()).unwrap(),
+                    gate
+                );
+                assert_eq!(call.trigger["score_threshold"], 12.0);
+            }
+            _ => panic!("expected Call"),
         }
     }
 }

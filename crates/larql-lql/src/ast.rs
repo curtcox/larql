@@ -164,6 +164,9 @@ pub enum Statement {
     RemovePatch {
         path: String,
     },
+    AttachCall {
+        path: String,
+    },
 
     // ── Trace ──
     /// Residual stream trace — decomposed forward pass.

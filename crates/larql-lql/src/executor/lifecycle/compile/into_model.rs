@@ -10,7 +10,7 @@ use crate::executor::Session;
 use larql_vindex::format::filenames::TOKENIZER_JSON;
 
 use super::atomic::run_atomic_compile;
-use super::collect_memit_facts_with_recording;
+use super::{collect_memit_facts_with_recording, reject_runtime_call_patches};
 
 impl Session {
     pub(super) fn exec_compile_into_model(
@@ -60,6 +60,7 @@ impl Session {
             .map(|r| r.operations.clone())
             .unwrap_or_default();
         let (_, _, patched) = self.require_vindex()?;
+        reject_runtime_call_patches(patched, &recording_ops, "MODEL")?;
         let collected = collect_memit_facts_with_recording(patched, vindex_path, &recording_ops)?;
         let memit_facts = collected.facts;
 
